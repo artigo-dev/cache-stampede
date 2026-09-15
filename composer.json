@@ -1,0 +1,54 @@
+{
+    "name": "artigo/cache-stampede",
+    "description": "Cache stampede protection for symfony/cache that does not stop at one machine.",
+    "keywords": [
+        "cache",
+        "cache-stampede",
+        "thundering-herd",
+        "symfony",
+        "redis",
+        "lock",
+        "dog-pile"
+    ],
+    "homepage": "https://github.com/artigo-dev/cache-stampede",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Marcin Gil",
+            "homepage": "https://github.com/marcing"
+        }
+    ],
+    "require": {
+        "php": ">=8.2",
+        "psr/cache": "^3.0",
+        "psr/log": "^1.1|^2|^3",
+        "symfony/cache": "^6.4|^7.0|^8.0",
+        "symfony/cache-contracts": "^3.1"
+    },
+    "require-dev": {
+        "friendsofphp/php-cs-fixer": "^3.95",
+        "phpstan/phpstan": "^2.0",
+        "phpunit/phpunit": "^10.5|^11.0",
+        "symfony/lock": "^6.4|^7.0|^8.0"
+    },
+    "suggest": {
+        "ext-redis": "For MemoLock, which is woken by a message instead of a poll",
+        "ext-relay": "Relay works anywhere ext-redis does",
+        "symfony/lock": "For FleetLock, which works with any Lock store"
+    },
+    "autoload": {
+        "psr-4": {
+            "Artigo\\Cache\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Artigo\\Cache\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable"
+}

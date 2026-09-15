@@ -1,0 +1,15 @@
+# Redis for the test suite and the benchmarks. Nothing else is needed:
+#   docker compose up -d && vendor/bin/phpunit
+#
+# volatile-ttl matches how these caches are actually run in production, and it
+# is one of the policies RedisTagAwareAdapter tolerates - it accepts noeviction
+# and volatile-*, and throws on every write under allkeys-*. This adapter is
+# happy under all of them, which is one of the differences the benchmark is
+# there to show: point it at an allkeys-lru Redis and Symfony's column
+# disappears rather than losing.
+services:
+    redis:
+        image: redis:8-alpine
+        command: redis-server --maxmemory-policy volatile-ttl --save ""
+        ports:
+            - "6379:6379"

@@ -1,0 +1,128 @@
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+
+permissions:
+    contents: read
+
+jobs:
+    tests:
+        name: "PHP ${{ matrix.php }} · Symfony ${{ matrix.symfony }} · Redis ${{ matrix.redis }}"
+        runs-on: ubuntu-latest
+
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    # the oldest of everything the README claims, together:
+                    # SET ... IFEQ and DELEX are Redis 8.4
+                    - php: '8.2'
+                      symfony: '6.4.*'
+                      redis: '8.4'
+                    # the LTS in the middle
+                    - php: '8.3'
+                      symfony: '7.4.*'
+                      redis: '8'
+                    # the newest of everything
+                    - php: '8.4'
+                      symfony: '8.1.*'
+                      redis: '8'
+                    - php: '8.5'
+                      symfony: '8.1.*'
+                      redis: '8'
+                    # the oldest Redis on the newest stack
+                    - php: '8.4'
+                      symfony: '8.1.*'
+                      redis: '8.4'
+
+        services:
+            redis:
+                image: "redis:${{ matrix.redis }}-alpine"
+                ports:
+                    - 6379:6379
+                options: >-
+                    --health-cmd "redis-cli ping"
+                    --health-interval 5s
+                    --health-timeout 3s
+                    --health-retries 10
+
+        steps:
+            - uses: actions/checkout@v5
+
+            - uses: shivammathur/setup-php@v2
+              with:
+                  php-version: "${{ matrix.php }}"
+                  extensions: redis
+                  coverage: none
+                  # Symfony validates cache keys inside \assert(), so with
+                  # assertions compiled out a quarter of its own conformance
+                  # suite silently stops testing anything. This is how Symfony
+                  # runs that suite itself.
+                  ini-values: zend.assertions=1
+
+            # resolve against the Symfony line of this leg rather than the
+            # lock file, which pins the newest
+            - uses: ramsey/composer-install@v4
+              with:
+                  dependency-versions: highest
+                  composer-options: "--with=symfony/cache:${{ matrix.symfony }} --with=symfony/lock:${{ matrix.symfony }}"
+
+            - run: vendor/bin/phpunit -c phpunit.dist.xml
+              env:
+                  REDIS_DSN: redis://127.0.0.1:6379
+
+    relay:
+        name: Relay client
+        runs-on: ubuntu-latest
+
+        services:
+            redis:
+                image: redis:8-alpine
+                ports:
+                    - 6379:6379
+                options: >-
+                    --health-cmd "redis-cli ping"
+                    --health-interval 5s
+                    --health-timeout 3s
+                    --health-retries 10
+
+        steps:
+            - uses: actions/checkout@v5
+
+            - uses: shivammathur/setup-php@v2
+              with:
+                  php-version: '8.4'
+                  extensions: redis, relay
+                  coverage: none
+                  ini-values: zend.assertions=1
+
+            - uses: ramsey/composer-install@v4
+
+            # the same suite, driven through Relay instead of ext-redis: the
+            # locks should not be able to tell which one they are holding
+            - run: vendor/bin/phpunit -c phpunit.dist.xml
+              env:
+                  REDIS_DSN: redis://127.0.0.1:6379
+                  REDIS_CLIENT: relay
+
+    static:
+        name: Coding standards and static analysis
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v5
+
+            - uses: shivammathur/setup-php@v2
+              with:
+                  php-version: '8.4'
+                  extensions: redis
+                  coverage: none
+
+            - uses: ramsey/composer-install@v4
+
+            - run: vendor/bin/php-cs-fixer check --diff
+
+            - run: vendor/bin/phpstan analyse -c phpstan.dist.neon --no-progress
