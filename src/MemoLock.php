@@ -170,10 +170,12 @@ final class MemoLock
      * 200 ms section in turn, the handovers cost 9 ms in total against 119 ms
      * when the waiters poll.
      *
-     * **What `symfony/lock` still does better:** it releases on destruct,
-     * where this releases when the closure returns, which is the same
-     * guarantee only if the work fits in a closure. Work that may outrun
-     * `$lockTtlMs` is handed a {@see KeepAlive}.
+     * **What `symfony/lock` still does better:** it releases on destruct, so
+     * a process that exits or fatals mid-section hands the lock back at
+     * shutdown, where a finally does not run at all. What that case costs
+     * here is the lock's remaining TTL, which is also the longest a waiter
+     * will wait for it. Work that may outrun `$lockTtlMs` is handed a
+     * {@see KeepAlive}.
      *
      * Unlike everything else in this class, this **throws** rather than
      * degrading: {@see LockUnavailable} when the lock cannot be reached or is

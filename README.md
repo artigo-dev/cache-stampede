@@ -237,9 +237,11 @@ reason. The extension is a single `SET … IFEQ` (Redis 8.4): it rewrites the
 lock only while it still carries our token, so nobody else's lock is ever
 touched.
 
-**What `symfony/lock` still does better:** it **releases on destruct**, where
-this releases when the closure returns — the same guarantee only if the work
-fits in a closure.
+**What `symfony/lock` still does better:** it **releases on destruct**, so a
+process that `exit()`s or fatals mid-section hands the lock back at shutdown,
+where a `finally` does not run at all. What that case costs here is the lock's
+remaining TTL, which is also the longest a waiter will wait for it — and a
+destructor is itself best effort, skipped on a hard crash.
 
 ### Per-call overrides
 
@@ -406,7 +408,7 @@ and **Redis 8.4+** for `MemoLock`, or `symfony/lock` for `FleetLock`.
 `MemoLock` is four plain commands and no script: `SET NX PX` takes the lock,
 `SET … IFEQ` extends it while it is still ours, `DELEX … IFEQ` releases it on
 the same condition, and `PUBLISH` wakes the waiters. The two conditional forms
-are what Redis 8.4 added, and what makes the Lua go away.
+are Redis 8.4, which is where the floor comes from.
 
 CI runs the suite on PHP 8.2 to 8.5 against Symfony 6.4, 7.4 and 8.1, on
 Redis 8.4 and the current 8.x, and through Relay.
