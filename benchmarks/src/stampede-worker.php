@@ -20,6 +20,7 @@ declare(strict_types=1);
 
 use Artigo\Cache\FleetLock;
 use Artigo\Cache\MemoLock;
+use Artigo\Cache\Store\PubSubRedisStore;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
 use Symfony\Component\Cache\LockRegistry;
 use Symfony\Component\Lock\LockFactory;
@@ -63,6 +64,13 @@ switch ($mode) {
         // Redis dependency of its own - and, for every store but a couple,
         // a 100 ms poll rather than a message
         $pool->setCallbackWrapper(new FleetLock(new LockFactory(new RedisStore($redis))));
+        break;
+
+    case 'fleetlock-pubsub':
+        // the same FleetLock, on a RedisStore that blocks through Pub/Sub:
+        // what symfony/lock would need for its waiters to be woken by a
+        // message rather than a poll - the RFC's option 3, measured
+        $pool->setCallbackWrapper(new FleetLock(new LockFactory(PubSubRedisStore::fromDsn($dsn))));
         break;
 
     case 'symfony-onehost':

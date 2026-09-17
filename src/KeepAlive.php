@@ -27,9 +27,10 @@ use Artigo\Cache\Exception\LockUnavailable;
  *     });
  *
  * The extension is one command - `SET key token PX ttl IFEQ token`, Redis
- * 8.4 - which rewrites the lock only while it still carries our token. A lock
- * that expired and was taken by somebody else carries theirs, and is left to
- * them.
+ * 8.4 and Valkey 8.1, or a compare-and-PEXPIRE script on servers without it
+ * (see RedisCommand) - which rewrites the lock only while it still carries
+ * our token. A lock that expired and was taken by somebody else carries
+ * theirs, and is left to them.
  *
  * It throws rather than answering false, for the reason
  * {@see MemoLock::exclusively()} throws and `symfony/lock`'s `refresh()` does:
@@ -76,12 +77,12 @@ final class KeepAlive
         }
 
         try {
-            $renewed = RedisCommand::raw($this->redis, $this->lockKey, 'SET', $this->token, 'PX', (string) ($ttlMs ?? $this->lockTtlMs), 'IFEQ', $this->token);
+            $renewed = RedisCommand::expireIfEqual($this->redis, $this->lockKey, $this->token, $ttlMs ?? $this->lockTtlMs);
         } catch (\Exception $e) {
             throw new LockUnavailable(\sprintf('Could not extend the lock on "%s": %s', $this->key, $e->getMessage()), 0, $e);
         }
 
-        if (true !== $renewed && 'OK' !== $renewed) {
+        if (!$renewed) {
             throw new LockUnavailable(\sprintf('The lock on "%s" is no longer held; it expired while the work was running.', $this->key));
         }
     }

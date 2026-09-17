@@ -27,6 +27,9 @@ declare(strict_types=1);
  *   php benchmarks/stampede.php modes=memolock,symfony-multihost
  *
  * Options: dsn=, workers=, resolverMs=, hosts=, lead=, modes=, keys=
+ * Modes: nolock, memolock, fleetlock (symfony/lock's RedisStore), fleetlock-pubsub
+ * (the same on a RedisStore whose waiters are woken by a message),
+ * symfony-onehost, symfony-multihost
  *
  * keys=collide gives every worker a *different* cold key, chosen so they all
  * land on the same LockRegistry slot. LockRegistry spreads the whole keyspace

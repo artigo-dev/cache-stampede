@@ -43,7 +43,13 @@ use Symfony\Contracts\Cache\ItemInterface;
  * The lock is four plain commands and no script: `SET NX PX` takes it,
  * `SET ... IFEQ` extends it while it is still ours, `DELEX ... IFEQ` releases
  * it on the same condition, and `PUBLISH` wakes whoever is waiting. The two
- * conditional forms are Redis 8.4.
+ * conditional forms are Redis 8.4; Valkey spells the release `DELIFEQ`, and a
+ * server with neither - Redis before 8.4, Valkey before 9 - gets a
+ * compare-and-set script for each instead, learnt from its first refusal (see
+ * RedisCommand).
+ *
+ * A waiter never waits past max_execution_time: a second before it, the item
+ * is computed unprotected instead, as LockRegistry does (see Deadline).
  *
  * **Probabilistic early expiration is not what this class does**, and $beta is
  * not read. Recomputing a little before expiry, at random, hoping the herd
@@ -195,6 +201,7 @@ final class MemoLock
     {
         [$lockKey, $channel] = $this->keysFor($key);
         $token = bin2hex(random_bytes(16));
+        $until = Deadline::beforeMaxExecutionTime();
 
         for ($attempt = 0; $attempt < self::ATTEMPTS; ++$attempt) {
             try {
@@ -214,7 +221,13 @@ final class MemoLock
             }
 
             $logger?->info('"{key}" is held elsewhere, waiting for it', ['key' => $key]);
-            $this->wait($lockKey, $channel, $logger);
+            $this->wait($lockKey, $channel, $logger, $until);
+
+            if (null !== $until && microtime(true) >= $until) {
+                // exclusivity was asked for, and there is no time left to wait
+                // for it: say so, rather than run beside the holder
+                throw new LockUnavailable(\sprintf('"%s" is still held, and max_execution_time is a second away.', $key));
+            }
         }
 
         throw new LockUnavailable(\sprintf('"%s" was still held after %d attempts.', $key, self::ATTEMPTS));
@@ -267,6 +280,7 @@ final class MemoLock
 
         [$lockKey, $channel] = $this->keysFor($key);
         $token = bin2hex(random_bytes(16));
+        $until = Deadline::beforeMaxExecutionTime();
 
         for ($attempt = 0; $attempt < self::ATTEMPTS; ++$attempt) {
             try {
@@ -289,9 +303,17 @@ final class MemoLock
             }
 
             $logger?->info('"{key}" is being produced, waiting for the holder', ['key' => $key]);
-            $this->wait($lockKey, $channel, $logger);
+            $this->wait($lockKey, $channel, $logger, $until);
 
             $produced = self::look($exists);
+
+            if (null === $produced && null !== $until && microtime(true) >= $until) {
+                // max_execution_time is a second away: produce now, unprotected,
+                // rather than be killed waiting
+                $logger?->warning('max_execution_time is near, producing "{key}" unprotected', ['key' => $key]);
+
+                return $make(KeepAlive::unheld($key));
+            }
 
             if (null !== $produced) {
                 $logger?->info('"{key}" was there after the lock was released', ['key' => $key]);
@@ -418,6 +440,7 @@ final class MemoLock
         $key = $item->getKey();
         [$lockKey, $channel] = $this->keysFor($key);
         $token = bin2hex(random_bytes(16));
+        $until = Deadline::beforeMaxExecutionTime();
 
         while (true) {
             try {
@@ -453,7 +476,15 @@ final class MemoLock
             }
 
             $logger?->info('Item "{key}" is locked, waiting for the holder', ['key' => $key]);
-            $this->wait($lockKey, $channel, $logger);
+            $this->wait($lockKey, $channel, $logger, $until);
+
+            if (null !== $until && microtime(true) >= $until) {
+                // max_execution_time is a second away: compute now, unprotected,
+                // rather than be killed waiting - the choice LockRegistry makes
+                $logger?->warning('max_execution_time is near, computing item "{key}" unprotected', ['key' => $key]);
+
+                return $callback($item, $save);
+            }
 
             if (\INF === $beta) {
                 // whoever forced this wants a value computed after they asked
@@ -529,7 +560,7 @@ final class MemoLock
     private function release(string $lockKey, string $channel, string $token, ?LoggerInterface $logger): void
     {
         try {
-            RedisCommand::raw($this->redis, $lockKey, 'DELEX', 'IFEQ', $token);
+            RedisCommand::deleteIfEqual($this->redis, $lockKey, $token);
             $this->redis->publish($channel, self::WAKE_MESSAGE);
         } catch (\Exception $e) {
             // the lock expires on its own; waiters notice within a slice
@@ -546,9 +577,15 @@ final class MemoLock
      * we subscribed is not waited for at all. One that is still held is
      * waited for - by message, for a slice, then looked at again.
      */
-    private function wait(string $lockKey, string $channel, ?LoggerInterface $logger): void
+    private function wait(string $lockKey, string $channel, ?LoggerInterface $logger, ?float $until = null): void
     {
         $deadline = microtime(true) + $this->waitTimeoutMs / 1000;
+
+        // never past max_execution_time (see Deadline): a waiter killed
+        // mid-wait serves nobody
+        if (null !== $until) {
+            $deadline = min($deadline, $until);
+        }
 
         if (null === $this->subscriberFactory) {
             $this->poll($lockKey, $deadline);

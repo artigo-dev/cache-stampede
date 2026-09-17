@@ -18,7 +18,8 @@ jobs:
             matrix:
                 include:
                     # the oldest of everything the README claims, together:
-                    # SET ... IFEQ and DELEX are Redis 8.4
+                    # SET ... IFEQ and DELEX are Redis 8.4, where the lock is
+                    # four plain commands; older servers get the scripts
                     - php: '8.2'
                       symfony: '6.4.*'
                       redis: '8.4'
@@ -37,10 +38,19 @@ jobs:
                     - php: '8.4'
                       symfony: '8.1.*'
                       redis: '8.4'
+                    # below the native commands: the compare-and-set scripts
+                    - php: '8.4'
+                      symfony: '8.1.*'
+                      redis: '7.2'
+                    # Valkey: SET IFEQ since 8.1, the release spelt DELIFEQ since 9.0
+                    - php: '8.4'
+                      symfony: '8.1.*'
+                      redis: 'valkey-9'
+                      image: 'valkey/valkey:9-alpine'
 
         services:
             redis:
-                image: "redis:${{ matrix.redis }}-alpine"
+                image: "${{ matrix.image || format('redis:{0}-alpine', matrix.redis) }}"
                 ports:
                     - 6379:6379
                 options: >-
