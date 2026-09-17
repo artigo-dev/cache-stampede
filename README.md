@@ -97,7 +97,7 @@ it degrades to polling the lock key, which is `FleetLock`'s wake-up with
 | overhead over a 300 ms origin call | **16 ms** | 134 ms |
 | origin calls, 12 requests / 12 servers | **1** | **1** |
 | connections | two, the second subscribing† | one |
-| needs | `ext-redis` or Relay, Redis 8.4+ | `symfony/lock` |
+| needs | `ext-redis` or Relay; Redis 7.2+ or Valkey 8+, plain commands on Redis 8.4 / Valkey 9 | `symfony/lock` |
 | outside a cache pool | `exclusively()`, `once()`, `KeepAlive` | — |
 
 \* except on the PostgreSQL stores, which block natively — fleet-wide *and*
@@ -109,6 +109,25 @@ one origin call, just a slower wake-up.
 same run against the same Redis: the benchmark wires `FleetLock` as
 `new FleetLock(new LockFactory(new RedisStore($redis)))`. What separates them is
 only how the waiter finds out, message versus poll.
+
+**The gap can be closed on the Lock side.** `PubSubRedisStore` is Symfony's
+`RedisStore` with the two blocking interfaces the component offers, its waiters
+blocking on a Pub/Sub channel named after the key until the holder's release
+publishes on it, PTTL-bounded. `FleetLock` on it inherits the wake-up with no
+Redis code of its own — the shape this would take inside `symfony/lock`, and
+the reason `MemoLock` need not become a class of the Cache component. The
+stampede benchmark's `fleetlock-pubsub` mode measures it — one run on Windows,
+Redis 8.8, PHP 8.5, one host, the same twelve requests on a 300 ms resolver:
+
+| | origin calls | overhead over the resolver |
+|---|---|---|
+| `MemoLock` | 1 / 12 | 37 ms |
+| `FleetLock` on `RedisStore` | 1 / 12 | 140 ms |
+| `FleetLock` on `PubSubRedisStore` | 1 / 12 | **23 ms** |
+
+Woken by a message, the Lock component's waiters were served 4 ms behind the
+holder — as close as `MemoLock`'s own, with no Redis command of their own in
+the cache.
 
 ### Where each one fits
 
@@ -125,7 +144,10 @@ is also the only one of the two that locks things that are **not cache items**
 - there *is* Redis, but you would rather have one lock abstraction across the
   application than a second, Redis-shaped one;
 - you cannot spare the second connection a blocking `SUBSCRIBE` needs;
-- the store is PostgreSQL, in which case the poll does not apply at all.
+- the store is PostgreSQL, in which case the poll does not apply at all;
+- the store is `PubSubRedisStore`, in which case the poll does not apply
+  either: the component's own waiters are woken by the message (see above),
+  and the Lock component keeps the whole lock story.
 
 Running `FleetLock` on Redis is an ordinary choice, not a fallback — it is what
 the benchmark measures. The only thing you give up is the wake-up latency.
@@ -233,9 +255,10 @@ it simply declare no parameter.
 It **throws** if the lock has gone — expired, and taken by somebody else while
 the work ran. That is the one thing a long section needs to hear, and a return
 value is too easy not to read; `symfony/lock`'s `refresh()` throws for the same
-reason. The extension is a single `SET … IFEQ` (Redis 8.4): it rewrites the
-lock only while it still carries our token, so nobody else's lock is ever
-touched.
+reason. The extension is a single `SET … IFEQ` (Redis 8.4, Valkey 8.1), or a
+compare-and-set script where the server has no such option: either way it
+rewrites the lock only while it still carries our token, so nobody else's lock
+is ever touched.
 
 **What `symfony/lock` still does better:** it **releases on destruct**, so a
 process that `exit()`s or fatals mid-section hands the lock back at shutdown,
@@ -357,10 +380,16 @@ files is still a list of local files.
 - Neither lock will ever be the reason a request fails: an unreachable Redis or
   lock store degrades to computing without protection, and says so through the
   PSR-3 logger.
+- **Neither lock waits into `max_execution_time`.** A second before the limit
+  the waiter stops and computes unprotected, as `LockRegistry` does, rather
+  than be killed with nothing computed and nothing served; `exclusively()`
+  throws `LockUnavailable` instead, since running beside the holder is the one
+  thing it must not do. A limit already past when the wait begins is ignored,
+  since it then counts CPU time or was restarted by `set_time_limit()`.
 - **A waiter looks at the lock before every `SUBSCRIBE`** and listens 100 ms
   at a time. A lock that is already gone is not waited for at all, a lock
   about to expire is waited for about that long, and a wake-up that went out
-  in the window before the subscription began - the holder was quick - costs
+  in the window before the subscription began — the holder was quick — costs
   one slice rather than the whole `waitTimeoutMs`. That slice is
   `LockRegistry`'s own poll granularity, so on a missed message the two are
   even; on a delivered one `MemoLock` is a millisecond behind the holder. The
@@ -403,15 +432,18 @@ them back, printing how often the origin was reached at each step.
 ## Requirements
 
 PHP 8.2+ · `symfony/cache` 6.4, 7.x or 8.x · and then either `ext-redis`/Relay
-and **Redis 8.4+** for `MemoLock`, or `symfony/lock` for `FleetLock`.
+and **Redis 7.2+ or Valkey 8+** for `MemoLock`, or `symfony/lock` for `FleetLock`.
 
-`MemoLock` is four plain commands and no script: `SET NX PX` takes the lock,
-`SET … IFEQ` extends it while it is still ours, `DELEX … IFEQ` releases it on
-the same condition, and `PUBLISH` wakes the waiters. The two conditional forms
-are Redis 8.4, which is where the floor comes from.
+On Redis 8.4 and Valkey 9, `MemoLock` is four plain commands and no script:
+`SET NX PX` takes the lock, `SET … IFEQ` extends it while it is still ours,
+`DELEX … IFEQ` (Valkey: `DELIFEQ`) releases it on the same condition, and
+`PUBLISH` wakes the waiters. A server without the two conditional forms gets a
+compare-and-set script for each — the same round trip, one `EVAL` — and the
+lock learns which dialect a connection speaks from its first refusal, so the
+fallback costs one refused command per connection, once.
 
 CI runs the suite on PHP 8.2 to 8.5 against Symfony 6.4, 7.4 and 8.1, on
-Redis 8.4 and the current 8.x, and through Relay.
+Redis 7.2, 8.4 and the current 8.x, on Valkey 9, and through Relay.
 
 ## Benchmarks
 
@@ -427,6 +459,10 @@ Every number above is something you can re-run rather than take on trust:
 lock file, which is the second table. `hosts=N` models a fleet by giving each
 worker its own `LockRegistry` file set — which is what a separate machine is to
 `flock`.
+
+`modes=` picks the locks to race: `nolock`, `memolock`, `fleetlock` on the
+component's `RedisStore`, `fleetlock-pubsub` on `PubSubRedisStore`, and the two
+`symfony-` rows for `LockRegistry` on one host and on a fleet.
 
 ## Licence
 

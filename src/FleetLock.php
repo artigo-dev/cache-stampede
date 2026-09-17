@@ -81,6 +81,7 @@ final class FleetLock
 
         $key = $item->getKey();
         $lock = $this->locks->createLock($this->prefix.$key, $this->ttl);
+        $until = Deadline::beforeMaxExecutionTime();
 
         for ($attempt = 0; $attempt < self::ATTEMPTS; ++$attempt) {
             try {
@@ -114,7 +115,15 @@ final class FleetLock
             }
 
             $logger?->info('Item "{key}" is locked, waiting for the holder', ['key' => $key]);
-            $this->waitFor($lock, $logger, $key);
+            $this->waitFor($lock, $logger, $key, $until);
+
+            if (null !== $until && microtime(true) >= $until) {
+                // max_execution_time is a second away: compute now, unprotected,
+                // rather than be killed waiting - the choice LockRegistry makes
+                $logger?->warning('max_execution_time is near, computing item "{key}" unprotected', ['key' => $key]);
+
+                return $callback($item, $save);
+            }
 
             if (\INF === $beta) {
                 // whoever forced this wants a value computed after they asked
@@ -156,16 +165,31 @@ final class FleetLock
      * same trap with flock(LOCK_SH); a store that cannot do shared locks falls
      * back to the exclusive one, which is slow but still correct.
      */
-    private function waitFor(LockInterface $lock, ?LoggerInterface $logger, string $key): void
+    private function waitFor(LockInterface $lock, ?LoggerInterface $logger, string $key, ?float $until = null): void
     {
+        $shared = $lock instanceof SharedLockInterface;
+
         try {
-            if ($lock instanceof SharedLockInterface) {
-                $lock->acquireRead(true);
+            if (null === $until || $until >= microtime(true) + $this->ttl) {
+                // blocking, as the component does it: natively on the stores
+                // that can, on a 100 ms poll elsewhere, and never for longer
+                // than the holder's lock can live
+                $acquired = $shared ? $lock->acquireRead(true) : $lock->acquire(true);
             } else {
-                $lock->acquire(true);
+                // max_execution_time ends before the lock would: poll with that
+                // deadline instead (see Deadline), the component's own interval
+                while (!$acquired = ($shared ? $lock->acquireRead(false) : $lock->acquire(false))) {
+                    if (microtime(true) >= $until) {
+                        break;
+                    }
+
+                    usleep(100_000);
+                }
             }
 
-            $lock->release();
+            if ($acquired) {
+                $lock->release();
+            }
         } catch (\Exception $e) {
             // a timeout or a lost store: fall through and read the pool anyway
             $logger?->debug('Stopped waiting on the lock for "{key}": {message}', ['key' => $key, 'message' => $e->getMessage()]);
