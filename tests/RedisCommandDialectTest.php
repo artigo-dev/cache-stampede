@@ -22,13 +22,18 @@ use PHPUnit\Framework\TestCase;
  * dialect is learnt from the server's first refusal and remembered, so the
  * price is one refused command per connection, once.
  *
- * The server here is a real Redis 8.x; a connection that refuses the native
- * forms on the client side stands in for the older ones, and the `DELIFEQ`
- * refusal is the real server's own - Redis has no such command.
+ * The server here is whatever REDIS_DSN points at - Redis 8.4 and later,
+ * Redis 7.2 or Valkey 9 in CI - and the expectations follow its dialect,
+ * probed once. A connection that refuses the native forms on the client side
+ * stands in for a server older than the one running; the refusals of commands
+ * the real server lacks are its own.
  */
 final class RedisCommandDialectTest extends TestCase
 {
     private RefusingRedis $redis;
+
+    /** @var array{delex: bool, delifeq: bool}|null what the real server answers to */
+    private static ?array $server = null;
 
     protected function setUp(): void
     {
@@ -43,7 +48,7 @@ final class RedisCommandDialectTest extends TestCase
         }
     }
 
-    public function testAServerThatSpeaksRedisEightReleasesNatively(): void
+    public function testAServerReleasesNativelyOnceItsDialectIsKnown(): void
     {
         $lock = new MemoLock($this->redis, lockTtlMs: 5_000, waitTimeoutMs: 500, pollIntervalMs: 10);
 
@@ -51,19 +56,20 @@ final class RedisCommandDialectTest extends TestCase
         $lock->exclusively('dialect', static fn (): string => 'done');
 
         self::assertSame(0, $this->redis->exists(self::lockKey('dialect')), 'the lock was released');
-        self::assertSame(['DELEX IFEQ', 'DELEX IFEQ'], $this->redis->attempts, 'one native command per release, nothing else tried');
+        self::assertSame([...$this->firstRelease(), ...$this->laterRelease()], $this->redis->attempts, 'the first release found the dialect, the second spoke it and tried nothing else');
     }
 
-    public function testAServerWithoutDelexReleasesThroughTheScriptAndIsAskedOnce(): void
+    public function testAServerWithoutDelexOrDelifeqReleasesThroughTheScriptAndIsAskedOnce(): void
     {
-        $this->redis->refuse = ['DELEX'];
+        // both native forms refused on the client side - on Redis the DELIFEQ
+        // refusal would be the server's own, on Valkey it would not
+        $this->redis->refuse = ['DELEX', 'DELIFEQ'];
         $lock = new MemoLock($this->redis, lockTtlMs: 5_000, waitTimeoutMs: 500, pollIntervalMs: 10);
 
         $lock->exclusively('dialect', static fn (): string => 'done');
 
         self::assertSame(0, $this->redis->exists(self::lockKey('dialect')), 'the script released the lock');
-        // DELEX refused by the client, DELIFEQ refused by Redis itself, then the script
-        self::assertSame(['DELEX IFEQ', 'DELIFEQ'], $this->redis->attempts);
+        self::assertSame(['DELEX IFEQ', 'DELIFEQ'], $this->redis->attempts, 'both native forms were tried, then the script');
 
         $lock->exclusively('dialect', static fn (): string => 'done');
 
@@ -93,7 +99,7 @@ final class RedisCommandDialectTest extends TestCase
         self::assertLessThan(150, $remaining['before'], 'the lock was about to expire');
         self::assertGreaterThan(250, $remaining['first'], 'the script pushed it out');
         self::assertGreaterThan(250, $remaining['second'], 'and again');
-        self::assertSame(['SET IFEQ', 'DELEX IFEQ'], $this->redis->attempts, 'IFEQ was tried once, then the script; the release still spoke Redis 8.4');
+        self::assertSame(['SET IFEQ', ...$this->firstRelease()], $this->redis->attempts, 'IFEQ was tried once, then the script; the release spoke whatever the server does');
     }
 
     public function testAnExtensionOfALostLockStillFailsThroughTheScript(): void
@@ -117,6 +123,44 @@ final class RedisCommandDialectTest extends TestCase
 
         self::assertTrue($failed, 'the script refuses to extend a lock that carries another token');
         self::assertSame('theirs', $this->redis->get(self::lockKey('dialect')), 'and the release left their lock alone');
+    }
+
+    /**
+     * What a release records on this server the first time: `DELEX` alone
+     * where the server has it, otherwise `DELEX` refused and `DELIFEQ` tried,
+     * whether that one is answered (Valkey) or refused too (older Redis, which
+     * then gets the script; the script is not a raw command and leaves no
+     * trace here).
+     *
+     * @return list<string>
+     */
+    private function firstRelease(): array
+    {
+        return $this->server()['delex'] ? ['DELEX IFEQ'] : ['DELEX IFEQ', 'DELIFEQ'];
+    }
+
+    /**
+     * And every release after, the refusals remembered: the one native form
+     * the server has, or nothing at all on the way to the script.
+     *
+     * @return list<string>
+     */
+    private function laterRelease(): array
+    {
+        $server = $this->server();
+
+        return $server['delex'] ? ['DELEX IFEQ'] : ($server['delifeq'] ? ['DELIFEQ'] : []);
+    }
+
+    /**
+     * @return array{delex: bool, delifeq: bool}
+     */
+    private function server(): array
+    {
+        return self::$server ??= [
+            'delex' => $this->redis->knows('DELEX', self::lockKey('probe'), 'IFEQ', 'x'),
+            'delifeq' => $this->redis->knows('DELIFEQ', self::lockKey('probe'), 'x'),
+        ];
     }
 
     private function clean(): void
@@ -175,6 +219,18 @@ final class RefusingRedis extends \Redis
         }
 
         return parent::rawCommand($command, ...$args);
+    }
+
+    /**
+     * Whether the real server answers this command at all - asked directly,
+     * so it leaves no trace in $attempts and cannot be refused from here.
+     */
+    public function knows(string $command, mixed ...$args): bool
+    {
+        $known = false !== parent::rawCommand($command, ...$args);
+        parent::clearLastError();
+
+        return $known;
     }
 
     public function getLastError(): ?string
