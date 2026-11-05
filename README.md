@@ -294,6 +294,141 @@ and the waiters see it expire and rebuild in parallel, which is the thing being
 prevented; too high and a holder that dies keeps everybody waiting before one
 of them retakes it.
 
+## Serving stale while it refreshes
+
+A lock keeps a hot key from being computed twelve times when it expires; the
+other eleven requests still wait for the one computation. `StaleCache` keeps
+them from waiting at all: for a grace period past its lifetime, a value is
+served at once while one process refreshes it.
+
+```php
+use Artigo\Cache\MemoLock;
+use Artigo\Cache\Stale\RefreshQueue;
+use Artigo\Cache\StaleCache;
+use Symfony\Component\Cache\Adapter\RedisAdapter;
+use Symfony\Contracts\Cache\ItemInterface;
+
+$lock = MemoLock::fromDsn('redis://127.0.0.1');
+$inner = new RedisAdapter(RedisAdapter::createConnection('redis://127.0.0.1'));
+$inner->setCallbackWrapper($lock);
+
+$pool = new StaleCache($inner, staleSeconds: 60, staleIfErrorSeconds: 600, election: $lock);
+$pool->setDeferrer($queue = new RefreshQueue());
+$queue->flushAtShutdown();
+
+$article = $pool->get('article-42', function (ItemInterface $item): Article {
+    $item->expiresAfter(300);   // fresh for five minutes, served stale for one more
+
+    return $this->load(42);
+});
+```
+
+**What is stored.** A `Record`: the value and its three times — fresh until
+the lifetime the callback set, servable while refreshed for `staleSeconds`
+more, kept for `staleIfErrorSeconds` after that. The times travel inside the
+value, so any marshaller carries them, `DeflateMarshaller` included, and the
+inner pool keeps the Record for all three.
+
+**Who refreshes.** A stale read is served at once, with
+`StaleCache::METADATA_STALE` in `$metadata`, and asks an `Election` for the
+refresh — without waiting: `MemoLock` and `FleetLock` take a lock of their own
+(`SET NX`, or a lock taken without blocking), `FlockElection`, the default, a
+local `flock()`, so N servers refresh N times, still without a stampede.
+`FlockElection` has no TTL: a refresh that hangs holds its lock file - one of
+64 the keys share - until the process ends, which in a long-running worker
+may be never. Give a worker `MemoLock` or `FleetLock`, whose locks expire. The
+winner looks again — another process may have refreshed it meanwhile — and
+then recomputes through the inner pool's forced `get()`, so through its lock
+wrapper too. A refresh that throws keeps the stale value, and logs it.
+
+**When.** Without a deferrer the refresh runs inline, and the request that
+found the value stale gets the new one. With a `RefreshQueue` as the deferrer
+it runs after the response. In a Symfony application the shipped subscriber
+flushes the queue on `kernel.terminate` and `console.terminate`:
+
+```yaml
+services:
+    Artigo\Cache\Stale\RefreshQueue: ~
+    Artigo\Cache\Stale\TerminateSubscriber:
+        arguments: ['@Artigo\Cache\Stale\RefreshQueue']
+        tags: [kernel.event_subscriber]
+    app.cache.articles:
+        class: Artigo\Cache\StaleCache
+        arguments: ['@cache.app', 60, 600]
+        calls: [[setDeferrer, ['@Artigo\Cache\Stale\RefreshQueue']]]
+```
+
+Without a kernel, `flushAtShutdown()` runs it when the script ends; under
+PHP-FPM call `fastcgi_finish_request()` first, or the client waits for it.
+
+**Stale-if-error.** Past its stale time a value is computed like a miss, by the
+request that reads it. If that throws, a value still within
+`staleIfErrorSeconds` is served instead and the failure logged; past that, or
+with `staleIfErrorSeconds: 0`, the exception reaches the caller.
+
+**What stays hard.** An invalidated value is never served stale: a tag
+invalidation, a delete or a clear makes the inner pool answer a miss, and the
+miss is computed. A forced `get()` (`$beta = INF`) recomputes over a fresh
+value. A value whose callback sets no lifetime never turns stale; give the
+decorator a `defaultLifetime`, not the inner pool.
+
+**The inner pool is storage.** What it holds is Records: read and write
+through the decorator. Its PSR-6 side is strict — `getItem()` on a stale value
+is a miss — and `save()` stores with the decorator's times.
+
+**On versioned-cache.** A refresh is the inner pool's forced `get()`, which
+[`artigo/versioned-cache`](https://github.com/artigo-dev/versioned-cache)
+guards like a miss: a delete that lands while the refresh computes refuses its
+write, and a tag invalidation leaves it stale.
+
+**After a tag invalidation, too.** A tag invalidation makes a value a miss,
+not a stale value: the inner pool answers a miss. With `soft: true`, and an
+inner pool that keeps what a soft invalidation reached — versioned-cache with
+`softGraceSeconds` — a value this pool wrote is served stale after its tag
+falls as well, counted from the invalidation, and refreshed once:
+
+```php
+$inner = new VersionedRedisTagAwareAdapter($redis, softGraceSeconds: 600);
+$inner->setCallbackWrapper($lock);   // before it is handed over
+
+$pool = new StaleCache($inner, staleSeconds: 60, election: $lock, soft: true);
+
+$pool->invalidateTags(['menu']);               // served stale, refreshed once
+$pool->invalidateTags(['price-42'], hard: true); // a miss, as ever
+```
+
+The opt-in is the pool's: a value written by a pool without `soft` is a miss
+after an invalidation whatever kind it was. A hard invalidation, a delete and
+a clear stay hard. The pool puts its own callback wrapper in front of the inner
+pool's, which a miss still goes through, so set the inner pool's lock first.
+With 300 fragments under one tag, twelve visitors reading 25 each and a 20 ms
+origin, a soft invalidation kept every visitor from waiting — 0 of 12 against
+12 of 12 at about 560 ms — and ran the 300 recomputations after the responses
+(versioned-cache's `benchmarks/soft.php`).
+
+Twelve requests at a hot key as its lifetime ends, a 300 ms origin, `MemoLock`
+on every row (`stampede.php modes=swr`):
+
+| Setup | Origin calls | Requests that waited for one | Wait p50 | Wait max |
+|---|---|---:|---:|---:|
+| `expiring` | 1 | 12 / 12 | 326 ms | 327 ms |
+| `beta` | 1 | 9 / 12 | 322 ms | 323 ms |
+| **`swr`** | 1 | **0 / 12** | **10 ms** | **12 ms** |
+
+`expiring` is the key going cold at the barrier: one computes, eleven wait for
+it. `beta` is Symfony's probabilistic early expiration with the twelve arriving
+in a burst 100 ms before the expiry, which is its worst case: with β = 1 and a
+300 ms computation each draws an early recomputation about 72 % of the time (7
+to 10 of 12 over three runs), and all of those wait behind the lock for the one
+that runs. Requests spread over the last seconds would mostly find the value
+already recomputed. `swr` serves every request at once and refreshes after the response; the
+origin call is the refresh. Redis 8.10.1, PHP 8.5, the benchmark in a container
+on the Redis container's network.
+
+```bash
+php benchmarks/stampede.php modes=swr
+```
+
 ## Measured, not asserted
 
 `benchmarks/stampede.php` spawns real processes, releases them on a shared
@@ -376,10 +511,19 @@ files is still a list of local files.
   waits for the lock like any other waiter and then takes it. It arrives on the
   same parameter but means something explicit — recompute now — so it still
   gets you a value computed after you asked, and it gets it behind the lock
-  rather than beside it.
+  rather than beside it. The item is read again after the wait, so a pool that
+  guards its writes compares the forced one with what the holder left.
 - Neither lock will ever be the reason a request fails: an unreachable Redis or
   lock store degrades to computing without protection, and says so through the
-  PSR-3 logger.
+  PSR-3 logger. A lock that cannot be handed back once the value is computed is
+  logged and left to expire; the value is still served.
+- **On Symfony 8.2, a save that fails reaches the caller.** The lock that
+  computes an item saves it itself, and passes what `save()` answered back
+  through the `$setMetadata` closure Symfony hands every wrapper, so a refused
+  or failed write shows up in `get()`'s `$metadata` as
+  `ItemInterface::METADATA_SAVE_FAILED`, as it does without a wrapper. The
+  value is returned either way. Earlier versions have no such key, and their
+  closure ignores the report.
 - **Neither lock waits into `max_execution_time`.** A second before the limit
   the waiter stops and computes unprotected, as `LockRegistry` does, rather
   than be killed with nothing computed and nothing served; `exclusively()`
@@ -433,6 +577,8 @@ them back, printing how often the origin was reached at each step.
 
 PHP 8.2+ · `symfony/cache` 6.4, 7.x or 8.x · and then either `ext-redis`/Relay
 and **Redis 7.2+ or Valkey 8+** for `MemoLock`, or `symfony/lock` for `FleetLock`.
+`StaleCache` needs nothing more; its `TerminateSubscriber` needs
+`symfony/event-dispatcher`.
 
 On Redis 8.4 and Valkey 9, `MemoLock` is four plain commands and no script:
 `SET NX PX` takes the lock, `SET … IFEQ` extends it while it is still ours,
@@ -442,8 +588,9 @@ compare-and-set script for each — the same round trip, one `EVAL` — and the
 lock learns which dialect a connection speaks from its first refusal, so the
 fallback costs one refused command per connection, once.
 
-CI runs the suite on PHP 8.2 to 8.5 against Symfony 6.4, 7.4 and 8.1, on
-Redis 7.2, 8.4 and the current 8.x, on Valkey 9, and through Relay.
+CI runs the suite on PHP 8.2 to 8.5 against Symfony 6.4, 7.4 and 8.1 and the
+8.2 development branch, on Redis 7.2, 8.4 and the current 8.x, on Valkey 9, and
+through Relay.
 
 ## Benchmarks
 
@@ -452,6 +599,7 @@ Every number above is something you can re-run rather than take on trust:
 | script | question it answers |
 |---|---|
 | `benchmarks/stampede.php` | how many requests reach the origin when a key goes cold, and what does waiting cost? |
+| `benchmarks/stampede.php modes=swr` | what does a request wait when a hot key turns stale, with a lock, with early expiration, and served stale? |
 | `examples/expensive-query.php` | eight requests, one cold cache key |
 | `examples/thumbnail.php` | four requests, one file that has to be generated |
 

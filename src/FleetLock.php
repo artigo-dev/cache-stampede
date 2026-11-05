@@ -11,6 +11,7 @@ declare(strict_types=1);
 
 namespace Artigo\Cache;
 
+use Artigo\Cache\Stale\Election;
 use Psr\Cache\CacheItemPoolInterface;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Lock\LockFactory;
@@ -49,7 +50,7 @@ use Symfony\Contracts\Cache\ItemInterface;
  * fleet costs nothing but a store you already run, and is worth having on its
  * own. The wake-up latency is a separate question, and a separate class.
  */
-final class FleetLock
+final class FleetLock implements Election
 {
     /**
      * Enough attempts to outlast a holder that dies with the lock, and few
@@ -80,13 +81,13 @@ final class FleetLock
         }
 
         $key = $item->getKey();
-        $lock = $this->locks->createLock($this->prefix.$key, $this->ttl);
+        $lock = $this->lock($key);
         $until = Deadline::beforeMaxExecutionTime();
 
         for ($attempt = 0; $attempt < self::ATTEMPTS; ++$attempt) {
             try {
                 $acquired = $lock->acquire();
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 // a lock that cannot be taken must not stop the application
                 $logger?->warning('Lock unavailable, computing item "{key}" unprotected: {message}', ['key' => $key, 'message' => $e->getMessage()]);
 
@@ -104,18 +105,38 @@ final class FleetLock
                             $setMetadata($item);
                         }
 
-                        $pool->save($item->set($value));
+                        $saved = $pool->save($item->set($value));
                         $save = false;
+
+                        // what save() answered: Symfony 8.2 reports a false
+                        // one to the caller in $metadata, earlier versions
+                        // take one argument and ignore it
+                        if (null !== $setMetadata) {
+                            $setMetadata($item, $saved);
+                        }
                     }
 
                     return $value;
                 } finally {
-                    $lock->release();
+                    try {
+                        $lock->release();
+                    } catch (\Throwable $e) {
+                        // thrown from a finally, it would replace the value just
+                        // computed; the lock expires on its own
+                        $logger?->warning('Could not release the lock on item "{key}": {message}', ['key' => $key, 'message' => $e->getMessage()]);
+
+                        // the lock's destructor tries the release again and
+                        // throws; dropped here, it throws where it is caught
+                        try {
+                            $lock = null;
+                        } catch (\Throwable) { // @phpstan-ignore catch.neverThrown (the destructor throws, which phpstan does not see)
+                        }
+                    }
                 }
             }
 
             $logger?->info('Item "{key}" is locked, waiting for the holder', ['key' => $key]);
-            $this->waitFor($lock, $logger, $key, $until);
+            $this->waitFor($logger, $key, $until);
 
             if (null !== $until && microtime(true) >= $until) {
                 // max_execution_time is a second away: compute now, unprotected,
@@ -128,8 +149,11 @@ final class FleetLock
             if (\INF === $beta) {
                 // whoever forced this wants a value computed after they asked
                 // for it, not the one the holder already had in flight. Race
-                // for the lock again rather than read what it left.
+                // for the lock again rather than serve what it left - but read
+                // it: a pool that guards its writes compares the write with
+                // its last read, and the holder has written since ours
                 $logger?->info('Force-recomputing item "{key}"', ['key' => $key]);
+                $pool->getItem($key);
 
                 continue;
             }
@@ -164,9 +188,13 @@ final class FleetLock
      * measured at 486 ms against a 300 ms origin call. LockRegistry avoids the
      * same trap with flock(LOCK_SH); a store that cannot do shared locks falls
      * back to the exclusive one, which is slow but still correct.
+     *
+     * The lock is one of its own, so that one whose release failed can be
+     * dropped here, where what its destructor throws is caught.
      */
-    private function waitFor(LockInterface $lock, ?LoggerInterface $logger, string $key, ?float $until = null): void
+    private function waitFor(?LoggerInterface $logger, string $key, ?float $until = null): void
     {
+        $lock = $this->lock($key);
         $shared = $lock instanceof SharedLockInterface;
 
         try {
@@ -190,9 +218,44 @@ final class FleetLock
             if ($acquired) {
                 $lock->release();
             }
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             // a timeout or a lost store: fall through and read the pool anyway
             $logger?->debug('Stopped waiting on the lock for "{key}": {message}', ['key' => $key, 'message' => $e->getMessage()]);
+
+            // the lock's destructor tries a failed release again and throws;
+            // dropped here, it throws where it is caught
+            try {
+                $lock = null;
+            } catch (\Throwable) { // @phpstan-ignore catch.neverThrown (the destructor throws, which phpstan does not see)
+            }
         }
+    }
+
+    /**
+     * Elects the one process that refreshes a stale value (see StaleCache):
+     * a lock of its own, taken without waiting.
+     */
+    public function tryLock(string $key, int $ttlMs): ?\Closure
+    {
+        // released by the closure alone: a release that threw must not be
+        // tried again by the destructor, outside anyone's catch
+        $lock = $this->locks->createLock($this->prefix.'refresh.'.$key, $ttlMs / 1000, false);
+
+        if (!$lock->acquire()) {
+            return null;
+        }
+
+        return static function () use ($lock): void {
+            $lock->release();
+        };
+    }
+
+    /**
+     * The lock on an item. Symfony 6.4 promises a LockInterface only, where
+     * later versions promise a SharedLockInterface.
+     */
+    private function lock(string $key): LockInterface
+    {
+        return $this->locks->createLock($this->prefix.$key, $this->ttl);
     }
 }

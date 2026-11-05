@@ -34,6 +34,13 @@ jobs:
                     - php: '8.5'
                       symfony: '8.1.*'
                       redis: '8'
+                    # Symfony's development branch: it reports a failed save
+                    # through $metadata, and is where what calls the wrapper
+                    # changes next
+                    - php: '8.5'
+                      symfony: '8.2.x-dev'
+                      redis: '8'
+                      dev: true
                     # the oldest Redis on the newest stack
                     - php: '8.4'
                       symfony: '8.1.*'
@@ -72,6 +79,16 @@ jobs:
                   # suite silently stops testing anything. This is how Symfony
                   # runs that suite itself.
                   ini-values: zend.assertions=1
+
+            # a development branch installs only where the project accepts dev
+            # stability; prefer-stable keeps every other package on a release.
+            # Set here, never in the committed composer.json.
+            - if: matrix.dev
+              run: |
+                  composer config minimum-stability dev
+                  composer config prefer-stable true
+                  # the soft tests need the sibling's unreleased interface
+                  composer require --dev --no-update artigo/versioned-cache:dev-main
 
             # resolve against the Symfony line of this leg rather than the
             # lock file, which pins the newest
