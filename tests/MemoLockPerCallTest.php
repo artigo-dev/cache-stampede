@@ -14,6 +14,7 @@ namespace Artigo\Cache\Tests;
 use Artigo\Cache\MemoLock;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
+use Symfony\Component\Cache\CacheItem;
 use Symfony\Contracts\Cache\ItemInterface;
 
 /**
@@ -181,6 +182,34 @@ final class MemoLockPerCallTest extends TestCase
         self::assertSame('recomputed', $value, 'force means force: computed, not read back');
         self::assertSame(1, $calls, 'and computed exactly once');
         self::assertGreaterThan(300, $waited, 'behind the lock rather than beside it');
+    }
+
+    public function testAForcedRecomputeReadsTheItemAgainAfterTheWait(): void
+    {
+        $pool = new class($this->redis, 'percall-test') extends RedisAdapter {
+            /** @var list<string> */
+            public array $events = [];
+
+            public function getItem(mixed $key): CacheItem
+            {
+                $this->events[] = 'read';
+
+                return parent::getItem($key);
+            }
+        };
+        $pool->setCallbackWrapper(new MemoLock($this->redis, lockTtlMs: 5_000, waitTimeoutMs: 2_000));
+
+        // somebody else holds the lock, and will have written by the time it
+        // is free
+        $this->redis->set($this->lockKeyFor('reread'), 'somebody-else', ['NX', 'PX' => 300]);
+
+        $pool->get('reread', static function (ItemInterface $item) use ($pool): string {
+            $pool->events[] = 'compute';
+
+            return 'recomputed';
+        }, \INF);
+
+        self::assertSame(['read', 'read', 'compute'], $pool->events, 'the read before the wait, the one after it, then the computation');
     }
 
     /**

@@ -13,6 +13,7 @@ namespace Artigo\Cache;
 
 use Artigo\Cache\Exception\InvalidArgumentException;
 use Artigo\Cache\Exception\LockUnavailable;
+use Artigo\Cache\Stale\Election;
 use Psr\Cache\CacheItemPoolInterface;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
@@ -71,10 +72,16 @@ use Symfony\Contracts\Cache\ItemInterface;
  * the whole $waitTimeoutMs. The subscriber connection is opened once per
  * instance and kept.
  */
-final class MemoLock
+final class MemoLock implements Election
 {
     private const LOCK_PREFIX = 'memolock:lock:';
     private const WAKE_PREFIX = 'memolock:wake:';
+
+    /**
+     * The refresh of a stale value has a lock of its own: a miss of the same
+     * key computing behind the item lock must not keep it from being elected.
+     */
+    private const REFRESH_PREFIX = 'memolock:refresh:';
 
     /**
      * Released on the wake channel, and checked nowhere: a waiter re-reads the
@@ -206,7 +213,7 @@ final class MemoLock
         for ($attempt = 0; $attempt < self::ATTEMPTS; ++$attempt) {
             try {
                 $acquired = $this->acquire($lockKey, $token);
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 throw new LockUnavailable(\sprintf('Could not reach the lock for "%s": %s', $key, $e->getMessage()), 0, $e);
             }
 
@@ -237,8 +244,8 @@ final class MemoLock
      * Produce something once, while everyone else waits for the thing rather
      * than for the lock.
      *
-     * The pattern php-library calls a standalone MemoLock: a thumbnail, a
-     * generated file, a provisioned resource. One caller makes it; the rest
+     * For a thing made once: a thumbnail, a generated file, a provisioned
+     * resource. One caller makes it; the rest
      * block until it exists and then carry on with it, instead of queueing to
      * make it again.
      *
@@ -285,7 +292,7 @@ final class MemoLock
         for ($attempt = 0; $attempt < self::ATTEMPTS; ++$attempt) {
             try {
                 $acquired = $this->acquire($lockKey, $token);
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 // a lock that cannot be taken must not stop the work
                 $logger?->warning('MemoLock unreachable, producing "{key}" unprotected: {message}', ['key' => $key, 'message' => $e->getMessage()]);
 
@@ -445,7 +452,7 @@ final class MemoLock
         while (true) {
             try {
                 $acquired = $this->acquire($lockKey, $token);
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 // a cache must never be the reason an application stops serving
                 $logger?->warning('MemoLock unreachable, computing item "{key}" unprotected: {message}', ['key' => $key, 'message' => $e->getMessage()]);
 
@@ -463,8 +470,15 @@ final class MemoLock
                             $setMetadata($item);
                         }
 
-                        $pool->save($item->set($value));
+                        $saved = $pool->save($item->set($value));
                         $save = false;
+
+                        // what save() answered: Symfony 8.2 reports a false
+                        // one to the caller in $metadata, earlier versions
+                        // take one argument and ignore it
+                        if (null !== $setMetadata) {
+                            $setMetadata($item, $saved);
+                        }
                     }
 
                     return $value;
@@ -489,8 +503,11 @@ final class MemoLock
             if (\INF === $beta) {
                 // whoever forced this wants a value computed after they asked
                 // for it, not the one the holder already had in flight. Race
-                // for the lock again rather than read what it left.
+                // for the lock again rather than serve what it left - but read
+                // it: a pool that guards its writes compares the write with
+                // its last read, and the holder has written since ours
                 $logger?->info('Force-recomputing item "{key}"', ['key' => $key]);
+                $pool->getItem($key);
 
                 continue;
             }
@@ -507,6 +524,24 @@ final class MemoLock
             // the holder died, or what it wrote expired at once: race for it
             $logger?->info('Item "{key}" still missing after the lock was released, retrying', ['key' => $key]);
         }
+    }
+
+    /**
+     * Elects the one process that refreshes a stale value (see StaleCache):
+     * one SET NX, and nobody waits for it.
+     */
+    public function tryLock(string $key, int $ttlMs): ?\Closure
+    {
+        $lockKey = self::REFRESH_PREFIX.self::tagFor($key);
+        $token = bin2hex(random_bytes(16));
+
+        if (!$this->redis->set($lockKey, $token, ['NX', 'PX' => $ttlMs])) {
+            return null;
+        }
+
+        return function () use ($lockKey, $token): void {
+            RedisCommand::deleteIfEqual($this->redis, $lockKey, $token);
+        };
     }
 
     private function acquire(string $lockKey, string $token): bool
@@ -545,9 +580,18 @@ final class MemoLock
      */
     private function keysFor(string $key): array
     {
-        $tag = '{'.strtr(base64_encode(hash('xxh128', $key, true)), '+/', '-_').'}';
+        $tag = self::tagFor($key);
 
         return [self::LOCK_PREFIX.$tag, self::WAKE_PREFIX.$tag];
+    }
+
+    /**
+     * A cluster hash tag for the key: whatever the key holds, a short one
+     * that keeps every key derived from it on one node.
+     */
+    private static function tagFor(string $key): string
+    {
+        return '{'.strtr(base64_encode(hash('xxh128', $key, true)), '+/', '-_').'}';
     }
 
     /**
@@ -556,13 +600,16 @@ final class MemoLock
      * wakes the waiters. The wake-up goes out either way: a waiter re-reads
      * rather than trusts it, so one too many costs a read and one too few
      * costs a slice.
+     *
+     * Never throws: it runs in a finally, where anything it threw, an \Error
+     * from the client included, would replace the value just computed.
      */
     private function release(string $lockKey, string $channel, string $token, ?LoggerInterface $logger): void
     {
         try {
             RedisCommand::deleteIfEqual($this->redis, $lockKey, $token);
             $this->redis->publish($channel, self::WAKE_MESSAGE);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             // the lock expires on its own; waiters notice within a slice
             $logger?->warning('MemoLock could not release "{key}": {message}', ['key' => $lockKey, 'message' => $e->getMessage()]);
         }
@@ -627,7 +674,7 @@ final class MemoLock
     {
         try {
             $ttl = $this->redis->pttl($lockKey);
-        } catch (\Exception) {
+        } catch (\Throwable) {
             return null;
         }
 
@@ -651,7 +698,7 @@ final class MemoLock
 
         try {
             $subscriber = $this->subscriber ??= $factory();
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             $logger?->debug('MemoLock could not open a subscriber connection: {message}', ['message' => $e->getMessage()]);
 
             return false;
@@ -671,7 +718,7 @@ final class MemoLock
             });
 
             return true;
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             // the slice passed without a message, or Redis went away
             $logger?->debug('MemoLock stopped waiting on "{channel}": {message}', ['channel' => $channel, 'message' => $e->getMessage()]);
         }
@@ -685,13 +732,13 @@ final class MemoLock
 
         try {
             $subscriber->unsubscribe([$channel]);
-        } catch (\Exception) {
+        } catch (\Throwable) {
             // it is beyond saving: the next wait opens a fresh one
             $this->subscriber = null;
 
             try {
                 $subscriber->close();
-            } catch (\Exception) {
+            } catch (\Throwable) {
             }
         } finally {
             restore_error_handler();
@@ -714,7 +761,7 @@ final class MemoLock
                 if (!$this->redis->exists($lockKey)) {
                     return;
                 }
-            } catch (\Exception) {
+            } catch (\Throwable) {
                 return;
             }
         }

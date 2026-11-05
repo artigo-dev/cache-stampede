@@ -14,6 +14,7 @@ namespace Artigo\Cache\Tests;
 use Artigo\Cache\FleetLock;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
+use Symfony\Component\Cache\CacheItem;
 use Symfony\Component\Lock\LockFactory;
 use Symfony\Component\Lock\Store\RedisStore;
 use Symfony\Contracts\Cache\ItemInterface;
@@ -134,6 +135,35 @@ final class FleetLockTest extends TestCase
         self::assertSame('recomputed', $value, 'force means force: computed, not read back');
         self::assertSame(1, $calls, 'and computed exactly once');
         self::assertGreaterThan(150, $waited, 'behind the lock rather than beside it');
+    }
+
+    public function testAForcedRecomputeReadsTheItemAgainAfterTheWait(): void
+    {
+        $pool = new class($this->redis, 'fleetlock-test') extends RedisAdapter {
+            /** @var list<string> */
+            public array $events = [];
+
+            public function getItem(mixed $key): CacheItem
+            {
+                $this->events[] = 'read';
+
+                return parent::getItem($key);
+            }
+        };
+        $pool->setCallbackWrapper(new FleetLock($this->locks(), 5.0));
+
+        // somebody else holds the lock, and will have written by the time it
+        // is free
+        $held = $this->locks()->createLock('cache.stampede.reread', 0.3);
+        self::assertTrue($held->acquire(), 'the test needs the lock first');
+
+        $pool->get('reread', static function (ItemInterface $item) use ($pool): string {
+            $pool->events[] = 'compute';
+
+            return 'recomputed';
+        }, \INF);
+
+        self::assertSame(['read', 'read', 'compute'], $pool->events, 'the read before the wait, the one after it, then the computation');
     }
 
     public function testAnUnreachableStoreComputesInsteadOfFailing(): void

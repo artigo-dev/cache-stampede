@@ -20,6 +20,8 @@ declare(strict_types=1);
 
 use Artigo\Cache\FleetLock;
 use Artigo\Cache\MemoLock;
+use Artigo\Cache\Stale\RefreshQueue;
+use Artigo\Cache\StaleCache;
 use Artigo\Cache\Store\PubSubRedisStore;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
 use Symfony\Component\Cache\LockRegistry;
@@ -44,11 +46,27 @@ $lockFiles = $options['lockFiles'];
 $redis = RedisAdapter::createConnection($dsn);
 
 $pool = new RedisAdapter($redis, 'stampede-'.$mode);
+$queue = null;
 
 switch ($mode) {
     case 'nolock':
         // the wrapper Symfony falls back to when locking is off: compute, always
         $pool->setCallbackWrapper(null);
+        break;
+
+    case 'expiring':
+    case 'beta':
+    case 'swr':
+        $memoLock = MemoLock::fromDsn($dsn, lockTtlMs: max(5_000, $resolverMs * 10), waitTimeoutMs: max(2_000, $resolverMs * 4));
+        $pool->setCallbackWrapper($memoLock);
+
+        if ('swr' === $mode) {
+            // served at once, refreshed after the response by the one elected
+            $queue = new RefreshQueue();
+            $pool = new StaleCache($pool, staleSeconds: 60, election: $memoLock);
+            $pool->setDeferrer($queue);
+        }
+
         break;
 
     case 'memolock':
@@ -119,11 +137,20 @@ try {
     $error = $e->getMessage();
 }
 
+// what the visitor waited for ends here; a deferred refresh runs after
+$seconds = microtime(true) - $began;
+
+try {
+    $queue?->flush();
+} catch (Throwable $e) {
+    $error = $e->getMessage();
+}
+
 echo json_encode([
     'index' => $index,
     'host' => $host,
     'origin' => $origin,
-    'seconds' => microtime(true) - $began,
+    'seconds' => $seconds,
     'late' => $late,
     'value' => $value,
     'error' => $error,

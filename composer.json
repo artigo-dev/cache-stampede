@@ -30,11 +30,13 @@
         "friendsofphp/php-cs-fixer": "^3.95",
         "phpstan/phpstan": "^2.0",
         "phpunit/phpunit": "^10.5|^11.0",
+        "symfony/event-dispatcher": "^6.4|^7.0|^8.0",
         "symfony/lock": "^6.4|^7.0|^8.0"
     },
     "suggest": {
         "ext-redis": "For MemoLock, which is woken by a message instead of a poll",
         "ext-relay": "Relay works anywhere ext-redis does",
+        "symfony/event-dispatcher": "For TerminateSubscriber, which runs StaleCache's refreshes after the response",
         "symfony/lock": "For FleetLock, which works with any Lock store"
     },
     "autoload": {

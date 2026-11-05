@@ -25,11 +25,24 @@ declare(strict_types=1);
  *   php benchmarks/stampede.php
  *   php benchmarks/stampede.php workers=12 resolverMs=300 hosts=12
  *   php benchmarks/stampede.php modes=memolock,symfony-multihost
+ *   php benchmarks/stampede.php modes=swr
  *
  * Options: dsn=, workers=, resolverMs=, hosts=, lead=, modes=, keys=
  * Modes: nolock, memolock, fleetlock (symfony/lock's RedisStore), fleetlock-pubsub
  * (the same on a RedisStore whose waiters are woken by a message),
  * symfony-onehost, symfony-multihost
+ *
+ * modes=swr asks another question: what does a visitor wait when a hot key
+ * turns stale? Its three rows share one warm key, written beforehand:
+ *
+ *   expiring   MemoLock, the key expiring at the barrier: one computes, the
+ *              rest wait for it
+ *   beta       MemoLock with Symfony's probabilistic early expiration, the
+ *              barrier 100 ms before the key expires: some recompute early,
+ *              behind the lock, and wait for it
+ *   swr        StaleCache over the same pool, the key's lifetime ending at the
+ *              barrier: every visitor is served the stale value at once, and
+ *              one refreshes it after its response
  *
  * keys=collide gives every worker a *different* cold key, chosen so they all
  * land on the same LockRegistry slot. LockRegistry spreads the whole keyspace
@@ -39,7 +52,9 @@ declare(strict_types=1);
  * to collide and nothing else.
  */
 
+use Artigo\Cache\StaleCache;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
+use Symfony\Contracts\Cache\ItemInterface;
 
 require __DIR__.'/../vendor/autoload.php';
 
@@ -58,6 +73,27 @@ $resolverMs = (int) ($options['resolverMs'] ?? 300);
 $hosts = (int) ($options['hosts'] ?? 3);
 $lead = (float) ($options['lead'] ?? 1.5);
 $modes = explode(',', (string) ($options['modes'] ?? 'nolock,memolock,symfony-onehost,symfony-multihost'));
+
+// the stale-while-revalidate question, against what it replaces
+if (['swr'] === $modes) {
+    $modes = ['expiring', 'beta', 'swr'];
+}
+
+/**
+ * The modes whose key is warm before the barrier, and what a visitor waits
+ * is the question.
+ */
+const WARM_MODES = ['expiring', 'beta', 'swr'];
+
+/**
+ * How long before its expiry the beta row's visitors arrive.
+ */
+const BETA_LEAD = 0.1;
+
+/**
+ * How long the warm key lives before the barrier.
+ */
+const WARM_SECONDS = 2;
 $colliding = 'collide' === ($options['keys'] ?? '');
 
 if ('\\' === \DIRECTORY_SEPARATOR) {
@@ -99,6 +135,10 @@ foreach ($modes as $mode) {
     $startAt = microtime(true) + $lead;
     $processes = [];
 
+    if (in_array($mode, WARM_MODES, true)) {
+        $startAt = warm($redis, $mode, $key, $resolverMs);
+    }
+
     for ($index = 0; $index < $workers; ++$index) {
         // onehost puts every worker on the same lock files; multihost deals
         // them out, which is exactly what separate machines look like
@@ -131,9 +171,15 @@ foreach ($modes as $mode) {
     $errors = array_filter(array_column($reports, 'error'));
     $slowest = max(array_map(static fn (array $report): float => (float) ($report['seconds'] ?? 0), $reports));
 
+    $waits = array_map(static fn (array $report): float => (float) ($report['seconds'] ?? 0), $reports);
+    sort($waits);
+
     $results[$mode] = [
         'origins' => $origins,
         'slowest' => $slowest,
+        'median' => $waits[intdiv(count($waits), 2)] ?? 0.0,
+        // waited for an origin call, their own or the lock holder's
+        'waited' => count(array_filter($waits, static fn (float $wait): bool => $wait > $resolverMs / 2000)),
         'overhead' => $slowest - $resolverMs / 1000,
         'late' => $late,
         'errors' => $errors,
@@ -157,10 +203,38 @@ foreach ($modes as $mode) {
 }
 
 echo \PHP_EOL;
+
+$warm = array_intersect_key($results, array_flip(WARM_MODES));
+
+if ([] !== $warm) {
+    echo '| Setup | Origin calls | Visitors who waited for one | Visitor wait p50 | Visitor wait max |'.\PHP_EOL;
+    echo '|---|---|---:|---:|---:|'.\PHP_EOL;
+
+    foreach ($warm as $mode => $result) {
+        echo sprintf('| `%s` | **%d** | %d / %d | %d ms | %d ms |%s',
+            $mode,
+            $result['origins'],
+            $result['waited'],
+            $workers,
+            (int) round($result['median'] * 1000),
+            (int) round($result['slowest'] * 1000),
+            \PHP_EOL,
+        );
+    }
+
+    echo \PHP_EOL;
+}
+
+$cold = array_diff_key($results, $warm);
+
+if ([] === $cold) {
+    exit(0);
+}
+
 echo '| Setup | Origin calls | Slowest worker | Overhead over the origin call |'.\PHP_EOL;
 echo '|---|---|---|---|'.\PHP_EOL;
 
-foreach ($results as $mode => $result) {
+foreach ($cold as $mode => $result) {
     echo sprintf('| `%s` | **%d / %d** | %.3f s | %d ms |%s',
         $mode,
         $result['origins'],
@@ -172,6 +246,47 @@ foreach ($results as $mode => $result) {
 }
 
 echo \PHP_EOL;
+
+/**
+ * Writes the key a warm mode's visitors find, and answers when they arrive:
+ * just after its lifetime ends, or, for beta, a little before, the value
+ * having taken the origin's time to compute, which is what early expiration
+ * weighs.
+ *
+ * The lifetime ends on a whole second: Symfony keeps the expiry it weighs in
+ * whole seconds, and hands Redis a TTL in whole seconds cut down.
+ */
+function warm(Redis|RedisCluster $redis, string $mode, string $key, int $resolverMs): float
+{
+    $pool = new RedisAdapter($redis, 'stampede-'.$mode);
+    // taken once the value is computed, which takes a while for beta
+    $expiry = static fn (): int => (int) ceil(microtime(true)) + WARM_SECONDS;
+
+    if ('swr' === $mode) {
+        $stale = new StaleCache($pool, staleSeconds: 60);
+        $endsAt = $expiry();
+        $stale->save($stale->getItem($key)->set('stale')->expiresAt(new DateTimeImmutable('@'.$endsAt)));
+    } else {
+        $endsAt = 0;
+        $pool->get($key, static function (ItemInterface $item) use ($mode, $resolverMs, $expiry, &$endsAt): string {
+            if ('beta' === $mode) {
+                usleep($resolverMs * 1000);
+            }
+
+            $endsAt = $expiry();
+
+            // the metadata keeps the whole second, the TTL Redis is given is
+            // cut down to one: beta's value outlives its barrier that way
+            $item->expiresAt('beta' === $mode ? DateTimeImmutable::createFromFormat('U.u', $endsAt.'.850000') ?: null : new DateTimeImmutable('@'.$endsAt));
+
+            return 'stale';
+        });
+    }
+
+    $expiry = $endsAt;
+
+    return 'beta' === $mode ? $expiry - BETA_LEAD : $expiry + BETA_LEAD;
+}
 
 /**
  * Distinct keys that all hash to the same LockRegistry slot, so the lock they
