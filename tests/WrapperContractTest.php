@@ -13,6 +13,7 @@ namespace Artigo\Cache\Tests;
 
 use Artigo\Cache\FleetLock;
 use Artigo\Cache\MemoLock;
+use Composer\InstalledVersions;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Cache\CacheItemInterface;
@@ -89,12 +90,13 @@ final class WrapperContractTest extends TestCase
     #[DataProvider('wrappers')]
     public function testARefusedSaveReachesTheCallerAsSaveFailed(string $wrapper): void
     {
-        if (!\defined(ItemInterface::class.'::METADATA_SAVE_FAILED')) {
+        // the constant alone says nothing: it comes with symfony/cache-contracts,
+        // which a symfony/cache that never sets it installs as well
+        $version = InstalledVersions::getVersion('symfony/cache');
+
+        if (null === $version || version_compare($version, '8.2.0.0-dev', '<')) {
             self::markTestSkipped('Symfony reports a failed save in $metadata from 8.2 on.');
         }
-
-        $failed = \constant(ItemInterface::class.'::METADATA_SAVE_FAILED');
-        self::assertIsString($failed);
 
         $events = [];
         $pool = new TagAwareAdapter(self::pool($events, refuse: true));
@@ -104,7 +106,7 @@ final class WrapperContractTest extends TestCase
 
         self::assertSame('computed', $value, 'a refused save still serves the value');
         self::assertIsArray($metadata);
-        self::assertTrue($metadata[$failed] ?? false, 'the refusal reached the caller');
+        self::assertTrue($metadata[ItemInterface::METADATA_SAVE_FAILED] ?? false, 'the refusal reached the caller');
     }
 
     #[DataProvider('wrappers')]
