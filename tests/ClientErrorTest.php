@@ -196,7 +196,7 @@ final class ClientErrorTest extends TestCase
             }
 
             /**
-             * @param array<mixed>|int|null $options
+             * @param array<mixed>|null $options
              */
             public function set(string $key, mixed $value, mixed $options = null): \Redis|string|bool
             {
@@ -214,7 +214,7 @@ final class ClientErrorTest extends TestCase
 
             /**
              * @param array<string>|string $key
-             * @param array<string>|string ...$other_keys
+             * @param string               ...$other_keys
              */
             public function exists(mixed $key, mixed ...$other_keys): \Redis|int|bool
             {

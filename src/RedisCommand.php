@@ -195,7 +195,8 @@ final class RedisCommand
             return $redis;
         }
 
-        $node = $redis->_instance($redis->_target($key));
+        $host = $redis->_target($key);
+        $node = \is_string($host) ? $redis->_instance($host) : null;
 
         return $node instanceof \Redis ? $node : null;
     }
