@@ -87,8 +87,9 @@ jobs:
               run: |
                   composer config minimum-stability dev
                   composer config prefer-stable true
-                  # the soft tests need the sibling's unreleased interface
-                  composer require --dev --no-update artigo/versioned-cache:dev-main
+                  # the soft tests need versioned-cache 2.0's soft invalidation, on
+                  # Redis 8 like this leg
+                  composer require --dev --no-update artigo/versioned-cache:^2.0
 
             # resolve against the Symfony line of this leg rather than the
             # lock file, which pins the newest
