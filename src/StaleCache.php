@@ -83,7 +83,7 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
 
     private readonly Election $election;
 
-    /** @var \Closure|null takes the refresh */
+    /** @var (\Closure(\Closure(): void, string): mixed)|null takes the refresh and its key */
     private ?\Closure $deferrer = null;
 
     private ?LoggerInterface $logger = null;
@@ -165,12 +165,34 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
     }
 
     /**
-     * Where a refresh goes instead of running inline: a callable taking the
-     * refresh, such as a RefreshQueue. Null runs it inline.
+     * Where a refresh goes instead of running inline, such as a RefreshQueue.
+     * Null runs it inline.
+     *
+     * The deferrer is called with the refresh, a \Closure that takes no
+     * argument, and a key: a string that is the same for every refresh of
+     * one cache key in this pool and differs for any other key or pool, so
+     * that it can hold one refresh per key. The key is passed only when the
+     * parameter that would receive it takes a string: a second parameter,
+     * or a variadic one, that is untyped or typed string, ?string, mixed or
+     * a union holding one of them. Any other deferrer, such as one of a
+     * single parameter or one whose second parameter is an int, is called
+     * with the refresh alone.
      */
     public function setDeferrer(?callable $deferrer): void
     {
-        $this->deferrer = null === $deferrer ? null : $deferrer(...);
+        if (null === $deferrer) {
+            $this->deferrer = null;
+
+            return;
+        }
+
+        $deferrer = $deferrer(...);
+
+        // an internal function refuses an argument it does not declare, and
+        // under strict types a typed parameter refuses a string
+        $this->deferrer = self::takesKey(new \ReflectionFunction($deferrer))
+            ? $deferrer
+            : static fn (\Closure $refresh): mixed => $deferrer($refresh);
     }
 
     public function setLogger(LoggerInterface $logger): void
@@ -372,9 +394,10 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
             return $this->refresh($key, $callback);
         }
 
+        // the pool in the key: two pools sharing a deferrer each keep their own
         ($this->deferrer)(function () use ($key, $callback): void {
             $this->refresh($key, $callback);
-        });
+        }, $key.'@'.$this->poolHash);
 
         return null;
     }
@@ -536,5 +559,41 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
         } else {
             unset($metadata[self::METADATA_STALE]);
         }
+    }
+
+    /**
+     * Whether the deferrer's parameter for a second argument takes the key.
+     */
+    private static function takesKey(\ReflectionFunction $deferrer): bool
+    {
+        $parameters = $deferrer->getParameters();
+
+        // the second argument lands in the second parameter, or in a
+        // variadic first one
+        $parameter = $parameters[1] ?? (isset($parameters[0]) && $parameters[0]->isVariadic() ? $parameters[0] : null);
+
+        return null !== $parameter && self::acceptsString($parameter->getType());
+    }
+
+    private static function acceptsString(?\ReflectionType $type): bool
+    {
+        if (null === $type) {
+            return true;
+        }
+
+        if ($type instanceof \ReflectionNamedType) {
+            return \in_array($type->getName(), ['string', 'mixed'], true);
+        }
+
+        if ($type instanceof \ReflectionUnionType) {
+            foreach ($type->getTypes() as $member) {
+                if (self::acceptsString($member)) {
+                    return true;
+                }
+            }
+        }
+
+        // an intersection holds objects only
+        return false;
     }
 }
