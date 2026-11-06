@@ -16,6 +16,7 @@ use Artigo\Cache\FleetLock;
 use Artigo\Cache\Stale\Record;
 use Artigo\Cache\Stale\RefreshQueue;
 use Artigo\Cache\StaleCache;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Cache\CacheItemPoolInterface;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
@@ -39,10 +40,14 @@ final class StaleCacheTest extends TestCase
 
     private int $computed = 0;
 
+    /** @var list<array<mixed>> the arguments of each call of a deferrer from a data provider */
+    private static array $given = [];
+
     protected function setUp(): void
     {
         $this->inner = new ArrayAdapter(0, false);
         $this->election = new SpyElection();
+        self::$given = [];
     }
 
     public function testAFreshValueIsAHit(): void
@@ -77,6 +82,131 @@ final class StaleCacheTest extends TestCase
 
         self::assertSame(1, $this->computed);
         self::assertSame('new', $pool->get('k', $this->compute('newer', 60)));
+    }
+
+    public function testStaleReadsOfOneKeyQueueOneRefresh(): void
+    {
+        $this->store('k', 'old', microtime(true) - 1, 60);
+        $this->store('other', 'old', microtime(true) - 1, 60);
+        $queue = new RefreshQueue();
+        $pool = $this->pool();
+        $pool->setDeferrer($queue);
+
+        // a worker that reads a stale key again and again before its queue is flushed
+        for ($i = 0; $i < 1_000; ++$i) {
+            self::assertSame('old', $pool->get('k', $this->compute('new', 60)));
+        }
+        $pool->get('other', $this->compute('new', 60));
+
+        self::assertSame(2, $queue->count(), 'one refresh per key, however often it is read');
+
+        // what the services resetter does after a message
+        $queue->reset();
+
+        self::assertSame(2, $this->computed);
+        self::assertSame('new', $pool->get('k', $this->compute('newer', 60)));
+    }
+
+    public function testPoolsSharingADeferrerEachQueueTheirOwnRefresh(): void
+    {
+        $this->store('k', 'old', microtime(true) - 1, 60);
+        $otherInner = new ArrayAdapter(0, false);
+        $otherInner->save($otherInner->getItem('k')->set(new Record('old', microtime(true) - 1, 60, 0))->expiresAfter(60));
+        $queue = new RefreshQueue();
+        $pool = $this->pool();
+        $pool->setDeferrer($queue);
+        $other = $this->pool($otherInner);
+        $other->setDeferrer($queue);
+
+        $pool->get('k', $this->compute('new', 60));
+        $other->get('k', $this->compute('new', 60));
+        self::assertSame(2, $queue->count(), 'the same key in another pool is another value');
+
+        $queue->flush();
+
+        self::assertSame('new', $other->get('k', $this->compute('newer', 60)));
+    }
+
+    public function testADeferrerOfOneParameterIsGivenTheRefreshAlone(): void
+    {
+        $this->store('k', 'old', microtime(true) - 1, 60);
+        $deferred = new \SplQueue();
+        $pool = $this->pool();
+
+        // an internal method, which refuses an argument it does not declare
+        $pool->setDeferrer($deferred->enqueue(...));
+
+        self::assertSame('old', $pool->get('k', $this->compute('new', 60)));
+        self::assertCount(1, $deferred);
+
+        $refresh = $deferred->dequeue();
+        self::assertInstanceOf(\Closure::class, $refresh);
+        $refresh();
+
+        self::assertSame('new', $pool->get('k', $this->compute('newer', 60)));
+    }
+
+    /**
+     * @return iterable<string, array{\Closure}>
+     */
+    public static function keyTakers(): iterable
+    {
+        yield 'string' => [static function (\Closure $refresh, string $key): void {
+            self::$given[] = \func_get_args();
+        }];
+        yield 'nullable string' => [static function (\Closure $refresh, ?string $key = null): void {
+            self::$given[] = \func_get_args();
+        }];
+        yield 'union holding string' => [static function (\Closure $refresh, int|string $key = 0): void {
+            self::$given[] = \func_get_args();
+        }];
+        yield 'mixed' => [static function (\Closure $refresh, mixed $key = null): void {
+            self::$given[] = \func_get_args();
+        }];
+        yield 'untyped' => [static function (\Closure $refresh, $key = null): void {
+            self::$given[] = \func_get_args();
+        }];
+        yield 'variadic' => [static function (\Closure $refresh, ...$more): void {
+            self::$given[] = \func_get_args();
+        }];
+        yield 'variadic string' => [static function (\Closure $refresh, string ...$more): void {
+            self::$given[] = \func_get_args();
+        }];
+        yield 'variadic from the first' => [static function (...$arguments): void {
+            self::$given[] = $arguments;
+        }];
+    }
+
+    #[DataProvider('keyTakers')]
+    public function testADeferrerWhoseSecondParameterTakesAStringIsGivenTheKey(\Closure $deferrer): void
+    {
+        $given = $this->deferStaleRead($deferrer);
+
+        self::assertCount(2, $given, 'the refresh and its key');
+        self::assertIsString($given[1]);
+    }
+
+    /**
+     * @return iterable<string, array{\Closure}>
+     */
+    public static function keyRefusers(): iterable
+    {
+        // under strict types each would throw a TypeError out of get()
+        yield 'int' => [static function (\Closure $refresh, int $priority = 0): void {
+            self::$given[] = \func_get_args();
+        }];
+        yield 'union without string' => [static function (\Closure $refresh, int|bool $priority = 0): void {
+            self::$given[] = \func_get_args();
+        }];
+        yield 'variadic of closures' => [static function (\Closure ...$refreshes): void {
+            self::$given[] = \func_get_args();
+        }];
+    }
+
+    #[DataProvider('keyRefusers')]
+    public function testADeferrerWhoseSecondParameterRefusesAStringIsGivenTheRefreshAlone(\Closure $deferrer): void
+    {
+        self::assertCount(1, $this->deferStaleRead($deferrer), 'the refresh alone');
     }
 
     public function testWithoutADeferrerTheRefreshRunsInline(): void
@@ -274,6 +404,31 @@ final class StaleCacheTest extends TestCase
         \assert($inner instanceof CacheInterface);
 
         return new StaleCache($inner, staleSeconds: 60, election: $this->election);
+    }
+
+    /**
+     * The arguments $deferrer is given for one stale read, once the refresh
+     * among them has run and stored the new value.
+     *
+     * @return array<mixed>
+     */
+    private function deferStaleRead(\Closure $deferrer): array
+    {
+        $this->store('k', 'old', microtime(true) - 1, 60);
+        $pool = $this->pool();
+        $pool->setDeferrer($deferrer);
+
+        self::assertSame('old', $pool->get('k', $this->compute('new', 60)));
+        self::assertCount(1, self::$given, 'deferred once');
+
+        $given = self::$given[0];
+        $refresh = $given[0] ?? null;
+        self::assertInstanceOf(\Closure::class, $refresh);
+        $refresh();
+
+        self::assertSame('new', $pool->get('k', $this->compute('newer', 60)));
+
+        return $given;
     }
 
     /**

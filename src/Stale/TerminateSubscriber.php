@@ -18,6 +18,9 @@ use Symfony\Component\EventDispatcher\EventSubscriberInterface;
  * comes after Response::send(), which under PHP-FPM has already called
  * fastcgi_finish_request(), and console.terminate after a command.
  *
+ * A Messenger worker is one command, so console.terminate comes only when it
+ * stops; between its messages the queue is flushed by its kernel.reset tag.
+ *
  * Needs symfony/event-dispatcher. The events are named, not imported, so
  * neither HttpKernel nor Console has to be installed.
  */

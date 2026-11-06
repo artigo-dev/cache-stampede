@@ -343,12 +343,17 @@ wrapper too. A refresh that throws keeps the stale value, and logs it.
 
 **When.** Without a deferrer the refresh runs inline, and the request that
 found the value stale gets the new one. With a `RefreshQueue` as the deferrer
-it runs after the response. In a Symfony application the shipped subscriber
-flushes the queue on `kernel.terminate` and `console.terminate`:
+it runs after the response, once per key: a stale read of a key whose refresh
+is already queued queues nothing. In a Symfony application the shipped
+subscriber flushes the queue on `kernel.terminate` and `console.terminate`, and
+the `kernel.reset` tag flushes it between the messages a Messenger worker
+handles — the worker is one command, so its `console.terminate` comes only
+when it stops:
 
 ```yaml
 services:
-    Artigo\Cache\Stale\RefreshQueue: ~
+    Artigo\Cache\Stale\RefreshQueue:
+        tags: [{ name: kernel.reset, method: reset }]
     Artigo\Cache\Stale\TerminateSubscriber:
         arguments: ['@Artigo\Cache\Stale\RefreshQueue']
         tags: [kernel.event_subscriber]
@@ -358,8 +363,29 @@ services:
         calls: [[setDeferrer, ['@Artigo\Cache\Stale\RefreshQueue']]]
 ```
 
+`messenger:consume` resets the tagged services after every message it handles,
+on Symfony 6.4 to 8.x, unless it runs with `--no-reset` (from 8.1,
+`--no-reset=N` resets every N messages); without a reset the queue waits for
+the worker to stop. A refresh that fails during a reset is logged rather than
+thrown, since a reset that throws stops the worker.
+
+A queue holds 1,000 refreshes at most; `new RefreshQueue(maxRefreshes: 5000)`
+sets another limit. Past it a stale read is served without a refresh queued:
+the first read turned away logs a warning (give the queue a logger with
+`setLogger()`), and a read after the next flush queues the refresh again.
+
 Without a kernel, `flushAtShutdown()` runs it when the script ends; under
 PHP-FPM call `fastcgi_finish_request()` first, or the client waits for it.
+
+Any callable can be the deferrer. It is called with the refresh, a `\Closure`
+that takes no argument, and a key that is the same for every refresh of one
+cache key in this pool and differs for any other key or pool, so a deferrer
+can hold one refresh per key as `RefreshQueue` does. The key is passed only
+when the parameter that would receive it takes a string: a second parameter,
+or a variadic one, that is untyped or typed `string`, `?string`, `mixed` or a
+union holding one of them. Any other deferrer — one of a single parameter, or
+one whose second parameter is an `int` or a `\Closure ...$refreshes` — is
+called with the refresh alone.
 
 **Stale-if-error.** Past its stale time a value is computed like a miss, by the
 request that reads it. If that throws, a value still within
