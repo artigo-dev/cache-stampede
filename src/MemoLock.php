@@ -180,7 +180,7 @@ final class MemoLock implements Election
      * A waiter here wants the lock, not a result, so it is woken and tries
      * again rather than looking for something to collect. That wake-up is the
      * reason this exists beside `symfony/lock`: on eight workers holding a
-     * 200 ms section in turn, the handovers cost 9 ms in total against 119 ms
+     * 200 ms section in turn, the handovers cost 10 ms in total against 105 ms
      * when the waiters poll.
      *
      * **What `symfony/lock` still does better:** it releases on destruct, so
@@ -263,7 +263,7 @@ final class MemoLock implements Election
      * refreshes a held lock, releases on destruct, and speaks to a dozen
      * stores. Use it for "only one worker may run this at a time". Use this
      * when the waiters want the *result*: its one advantage is that they are
-     * woken by a message rather than by a poll, which was 16 ms against 107 ms
+     * woken by a message rather than by a poll, which was 4 ms against 101 ms
      * where the stampede benchmark could measure it.
      *
      * $exists is asked before the lock is taken, so a caller arriving after the
