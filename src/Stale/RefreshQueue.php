@@ -17,25 +17,37 @@ use Psr\Log\LoggerInterface;
 use Symfony\Contracts\Service\ResetInterface;
 
 /**
- * Holds the refreshes StaleCache defers until the response has gone out, one
- * per key.
+ * Collects the refreshes StaleCache puts off, and runs them after the
+ * response has gone out, so that no visitor waits for them. It keeps one
+ * refresh per key.
  *
- * Given to StaleCache::setDeferrer(), it is flushed by TerminateSubscriber on
- * kernel.terminate and console.terminate, or at shutdown by
- * flushAtShutdown() where there is no kernel. A Messenger worker sends
- * console.terminate only when it stops: tagged kernel.reset, the queue is
- * flushed by reset() after every message the worker handles. Under PHP-FPM
- * without a kernel, call fastcgi_finish_request() before the script ends, or
- * the client waits for the refreshes too.
+ * Example: a page reads 25 stale fragments. Without a queue, the page waits
+ * for 25 refreshes before it is sent. With this queue as the deferrer, the
+ * page is sent with the stale fragments, and the 25 refreshes run
+ * afterwards. A second stale read of the same fragment queues nothing more.
  *
- * It holds $maxRefreshes at most. Past that a refresh is not queued: its
- * stale value is served as it is, and a read after the next flush queues it.
+ * Pass it to StaleCache::setDeferrer(). Something then has to run the queue:
+ *
+ * - In a Symfony application, TerminateSubscriber flushes it on
+ *   kernel.terminate and console.terminate.
+ * - A Messenger worker is one long command, so console.terminate comes only
+ *   when it stops. Tag the queue kernel.reset, and reset() runs it after
+ *   every message the worker handles.
+ * - Without a kernel, flushAtShutdown() runs it when the script ends. Under
+ *   PHP-FPM, call fastcgi_finish_request() before the script ends, or the
+ *   client waits for the refreshes too.
+ *
+ * It holds $maxRefreshes at most. When it is full, a stale read queues no
+ * refresh: the stale value is served as it is, and a read after the next
+ * flush queues the refresh again.
  */
 final class RefreshQueue implements ResetInterface, LoggerAwareInterface
 {
     /**
-     * In the order queued: one with a key under that key, prefixed so that a
-     * numeric one stays a string, one without under the next integer.
+     * The queued refreshes, in the order they were queued. A refresh with a
+     * key is stored under 'key:' and that key; the prefix keeps a numeric key
+     * from turning into an integer array key. A refresh without a key is
+     * stored under the next integer.
      *
      * @var array<int|string, \Closure(): mixed>
      */
@@ -43,7 +55,7 @@ final class RefreshQueue implements ResetInterface, LoggerAwareInterface
 
     private bool $atShutdown = false;
 
-    /** whether a refresh was turned away since the queue was last emptied */
+    /** whether the full queue turned a refresh away since it was last emptied */
     private bool $full = false;
 
     private ?LoggerInterface $logger = null;
@@ -60,21 +72,22 @@ final class RefreshQueue implements ResetInterface, LoggerAwareInterface
     }
 
     /**
-     * Queues $refresh, unless one for the same $key is queued already: a
-     * second stale read of a value would renew it no sooner. Without a key
-     * it is always queued.
+     * Queues $refresh, unless a refresh for the same $key is already queued.
+     * A second refresh of the same value would not make it fresh any sooner.
+     * Without a key, the refresh is always queued.
      */
     public function __invoke(\Closure $refresh, ?string $key = null): void
     {
         $slot = null === $key ? null : 'key:'.$key;
 
+        // a refresh for this key is already queued
         if (null !== $slot && isset($this->refreshes[$slot])) {
             return;
         }
 
         if (\count($this->refreshes) >= $this->maxRefreshes) {
-            // once until the queue is emptied: a page of stale reads would
-            // otherwise log one line each
+            // full: log it only once until the queue is emptied, otherwise a
+            // page of stale reads would log one line each
             if (!$this->full) {
                 $this->full = true;
                 $this->logger?->warning('The refresh queue holds {max} refreshes; until it is flushed, a stale value is served without one queued.', ['max' => $this->maxRefreshes, 'key' => $key]);
@@ -96,9 +109,9 @@ final class RefreshQueue implements ResetInterface, LoggerAwareInterface
     }
 
     /**
-     * Runs every refresh once, those queued while it runs included, and
-     * empties the queue. One that throws does not keep the others from
-     * running; the first failure is thrown once they all have.
+     * Runs every queued refresh once, including refreshes queued while it
+     * runs, and empties the queue. If one throws, the others still run; the
+     * first exception is thrown after all of them have run.
      */
     public function flush(): void
     {
@@ -110,9 +123,10 @@ final class RefreshQueue implements ResetInterface, LoggerAwareInterface
     }
 
     /**
-     * Flushes, for whatever ends a unit of work - Symfony's services_resetter
-     * between Messenger messages. A refresh that fails is logged rather than
-     * thrown: a reset that throws stops the worker.
+     * Runs the queue at the end of a unit of work, for example between two
+     * Messenger messages, through Symfony's services_resetter. A refresh that
+     * fails is logged instead of thrown, because a reset that throws stops
+     * the worker.
      */
     public function reset(): void
     {
@@ -138,8 +152,8 @@ final class RefreshQueue implements ResetInterface, LoggerAwareInterface
     }
 
     /**
-     * Runs and removes every refresh; one that throws keeps no other from
-     * running.
+     * Runs and removes every refresh. One that throws does not stop the
+     * others.
      *
      * @return list<\Throwable> what they threw, in order
      */
@@ -147,10 +161,13 @@ final class RefreshQueue implements ResetInterface, LoggerAwareInterface
     {
         $failures = [];
 
+        // always take the first refresh left, so refreshes queued while this
+        // runs are run too
         while (null !== $slot = array_key_first($this->refreshes)) {
             $refresh = $this->refreshes[$slot];
 
-            // taken off before it runs: a flush() from inside it does not run it again
+            // removed before it runs, so a flush() called from inside the
+            // refresh does not run it a second time
             unset($this->refreshes[$slot]);
 
             try {

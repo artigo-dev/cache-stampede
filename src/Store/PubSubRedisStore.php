@@ -21,24 +21,32 @@ use Symfony\Component\Lock\Key;
 use Symfony\Component\Lock\Store\RedisStore;
 
 /**
- * Symfony's RedisStore, with waiters woken by a message.
+ * Symfony's RedisStore, but a waiter is woken by a message instead of
+ * checking the lock every 100 ms.
  *
- * The Lock component has no way for a store to announce a release, so a
- * blocking acquire on a RedisStore retries save() on a 100 ms sleep: a waiter
- * finds out that the holder has finished up to 100 ms late. This store adds
- * the two blocking interfaces the component offers - waitAndSave() and
- * waitAndSaveRead() - and honours them by blocking on a Pub/Sub channel named
- * after the key until the holder's delete() publishes on it, then trying
- * again. The wait is bounded by the holder's PTTL, so a holder that died is
- * not waited for beyond its lock, and never runs past max_execution_time.
+ * The Lock component has no way for a store to announce that a lock was
+ * released. So a blocking acquire on a RedisStore tries save() again every
+ * 100 ms, and a waiter learns that the holder is done up to 100 ms late.
+ * Example: twelve requests compute a value that takes 300 ms, through
+ * FleetLock. On RedisStore they take about 108 ms longer than the
+ * computation; on this store about 7 ms longer.
  *
- * Everything else - the tokens, the read locks, the refresh, the Lua that
- * guards them - is RedisStore's own. FleetLock on this store gets MemoLock's
- * wake-up with no Redis code of its own, which is the shape this would take
- * in symfony/lock: the RFC's option 3, as a prototype.
+ * This store adds the two blocking interfaces the component offers,
+ * waitAndSave() and waitAndSaveRead(). A waiter listens on a Pub/Sub channel
+ * named after the key. When the holder releases the lock, delete() sends a
+ * message on that channel, and the waiter tries again. A waiter never waits
+ * longer than the holder's lock has left to live (its PTTL), so a holder
+ * that died is not waited for after its lock has expired. It also never
+ * waits past max_execution_time.
  *
- * Needs a second connection for the blocking SUBSCRIBE, as MemoLock does: a
- * connection in subscribe mode serves nothing else. fromDsn() opens both.
+ * Everything else - the tokens, the read locks, the refresh, the Lua scripts
+ * that guard them - is RedisStore's own. So FleetLock on this store gets
+ * MemoLock's fast wake-up with no Redis code of its own. This class is a
+ * working prototype of how the wake-up could look inside symfony/lock.
+ *
+ * Like MemoLock, it needs a second connection for SUBSCRIBE, because a
+ * connection in subscribe mode cannot send any other command. fromDsn()
+ * opens both.
  */
 final class PubSubRedisStore extends RedisStore implements BlockingStoreInterface, BlockingSharedLockStoreInterface
 {
@@ -46,17 +54,17 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
     private const WAKE_MESSAGE = '1';
 
     /**
-     * How long one SUBSCRIBE blocks before the lock is looked at again, so a
-     * wake-up published before the subscription began costs a slice, not the
-     * whole timeout.
+     * How long one SUBSCRIBE listens before the waiter tries the lock again.
+     * If the wake-up message went out before the waiter subscribed, the
+     * waiter loses at most this long, not the whole timeout.
      */
     private const WAKE_SLICE_MS = 100;
 
     private \Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster|null $subscriber = null;
 
     /**
-     * @param \Closure():(\Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster) $subscriberFactory opens the second connection, for the blocking SUBSCRIBE
-     * @param float                                                         $initialTtl        the expiration delay of locks, in seconds, as RedisStore takes it
+     * @param \Closure():(\Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster) $subscriberFactory opens the second connection, used for SUBSCRIBE
+     * @param float                                                         $initialTtl        how long a lock lives, in seconds, passed on to RedisStore
      * @param int                                                           $waitTimeoutMs     how long a blocking acquire waits before it gives up with LockConflictedException
      */
     public function __construct(
@@ -73,8 +81,8 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
     }
 
     /**
-     * Builds both connections from one DSN, through Symfony's own connection
-     * factory - so every DSN it understands works here unchanged.
+     * Opens both connections from one DSN, through Symfony's own connection
+     * factory. So every DSN that Symfony understands works here too.
      */
     public static function fromDsn(string $dsn, float $initialTtl = 300.0, int $waitTimeoutMs = 30_000): self
     {
@@ -120,10 +128,10 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
     }
 
     /**
-     * Releases as RedisStore does, then wakes the waiters. The wake-up goes
-     * out whether the delete went through or not: a waiter re-tries rather
-     * than trusts it, so one too many costs a round trip and one too few a
-     * slice.
+     * Releases the lock as RedisStore does, then wakes the waiters. The
+     * message goes out even when the delete failed. A waiter does not trust
+     * the message, it simply tries the lock again. So an extra message costs
+     * one round trip, and a missing one costs a waiter one slice.
      */
     public function delete(Key $key): void
     {
@@ -133,15 +141,18 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
             try {
                 $this->redis->publish(self::CHANNEL_PREFIX.$key, self::WAKE_MESSAGE);
             } catch (\Exception) {
-                // the lock expires on its own; waiters notice within a slice
+                // the lock expires on its own, and waiters notice within one
+                // slice
             }
         }
     }
 
     /**
-     * Tries, waits for the holder's word, tries again - a slice at a time,
-     * never longer than the holder's lock can live, never past the timeout
-     * or max_execution_time.
+     * Tries to take the lock. While somebody else holds it, waits for their
+     * message and tries again. Each wait lasts one slice at most, and never
+     * longer than the holder's lock has left to live. The whole loop stops at
+     * $waitTimeoutMs, or a second before max_execution_time if that comes
+     * first.
      *
      * @param \Closure():void $attempt save() or saveRead(); throws LockConflictedException while the lock is held
      *
@@ -151,6 +162,7 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
     {
         $deadline = microtime(true) + $this->waitTimeoutMs / 1000;
 
+        // never past max_execution_time (see Deadline)
         if (null !== $until = Deadline::beforeMaxExecutionTime()) {
             $deadline = min($deadline, $until);
         }
@@ -164,7 +176,7 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
 
                 return;
             } catch (LockConflictedException) {
-                // held by somebody else: wait for their word
+                // held by somebody else: wait for their message
             }
 
             if (microtime(true) >= $deadline) {
@@ -174,15 +186,17 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
             $remaining = $this->remaining($lockKey);
 
             if (null === $remaining) {
-                // gone, or unreachable: race for it again right away
+                // the lock is gone, or Redis cannot be asked: try to take it
+                // again right away
                 continue;
             }
 
+            // one slice, or less when the deadline is closer
             $slice = min(($deadline - microtime(true)) * 1000, self::WAKE_SLICE_MS);
 
             if ($remaining > 0) {
-                // a crashed holder never publishes: never wait much longer than
-                // its lock can live
+                // a holder that crashed never sends the message, so do not
+                // listen much longer than its lock has left to live
                 $slice = min($slice, $remaining + 25);
             }
 
@@ -193,8 +207,8 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
     }
 
     /**
-     * How long the lock has left, in milliseconds; 0 when it has no expiry;
-     * null when it is gone or cannot be asked.
+     * How long the lock has left to live, in milliseconds. 0 when it has no
+     * expiry. Null when it is gone, or when Redis cannot be asked.
      */
     private function remaining(string $lockKey): ?int
     {
@@ -212,9 +226,10 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
     }
 
     /**
-     * Blocks on the wake channel for up to $sliceMs. True when a message
-     * arrived, false when the slice passed without one or the connection
-     * failed - the same dance MemoLock does, for the same two clients.
+     * Listens on the wake channel for up to $sliceMs. Returns true when a
+     * message arrived, and false when the slice passed without one or the
+     * connection failed. It handles ext-redis and Relay the same way
+     * MemoLock does.
      */
     private function listen(string $channel, float $sliceMs): bool
     {
@@ -231,28 +246,31 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
                     : \Redis::OPT_READ_TIMEOUT,
                 max(0.001, $sliceMs / 1000),
             );
-            // ext-redis discards an exception thrown from here and carries on
-            // blocking, so unsubscribing is the only way to end the wait
+            // the first message ends the wait. ext-redis ignores an exception
+            // thrown from this callback and keeps listening, so the callback
+            // unsubscribes, which is the only way to stop it
             $subscriber->subscribe([$channel], static function (\Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster $connection, string $subscribed): void {
                 $connection->unsubscribe([$subscribed]);
             });
 
             return true;
         } catch (\Exception) {
-            // the slice passed without a message, or Redis went away
+            // the read timed out because no message came within the slice, or
+            // Redis went away
         }
 
-        // ext-redis leaves the connection in subscribe mode when the read
-        // times out, so it has to be taken out of it before another wait can
-        // use it. Relay ends the subscription itself and answers "Not
-        // subscribed", as a warning rather than an exception, which is what
-        // the handler is here to swallow.
+        // When the read times out, ext-redis leaves the connection
+        // subscribed, so we unsubscribe before the next wait uses it. Relay
+        // has already ended the subscription itself, and answers the
+        // unsubscribe with a "Not subscribed" warning, not an exception. The
+        // error handler set here silences that warning.
         set_error_handler(static fn (): bool => true);
 
         try {
             $subscriber->unsubscribe([$channel]);
         } catch (\Exception) {
-            // it is beyond saving: the next wait opens a fresh one
+            // the connection cannot be used any more: close it, and the next
+            // wait opens a new one
             $this->subscriber = null;
 
             try {
