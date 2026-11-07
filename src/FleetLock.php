@@ -182,12 +182,12 @@ final class FleetLock implements Election
      * Blocks until the holder releases, then lets go again: this side wants
      * the value, not the lock.
      *
-     * A *read* lock, so that waiters wake together. Taking the exclusive lock
-     * would hand it to them one at a time, and the last of twelve would wait
-     * out eleven acquire-release cycles before it ever looked at the pool -
-     * measured at 486 ms against a 300 ms origin call. LockRegistry avoids the
-     * same trap with flock(LOCK_SH); a store that cannot do shared locks falls
-     * back to the exclusive one, which is slow but still correct.
+     * A *read* lock, so that waiters wake together, as LockRegistry does with
+     * flock(LOCK_SH). The exclusive lock would hand it to them one at a time:
+     * twelve waiters on a 300 ms origin call were served 12 ms behind it on
+     * PubSubRedisStore against 7 ms on the read lock, and 106 ms against
+     * 108 ms on RedisStore, where the 100 ms poll decides. A store that cannot
+     * do shared locks falls back to the exclusive one, which is still correct.
      *
      * The lock is one of its own, so that one whose release failed can be
      * dropped here, where what its destructor throws is caught.
