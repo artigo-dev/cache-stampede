@@ -14,15 +14,18 @@ namespace Artigo\Cache\Stale;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
 
 /**
- * Runs the deferred refreshes once the response is out: kernel.terminate
- * comes after Response::send(), which under PHP-FPM has already called
- * fastcgi_finish_request(), and console.terminate after a command.
+ * Runs the queued refreshes after the response has gone out, so the visitor
+ * does not wait for them. kernel.terminate fires after Response::send(),
+ * which under PHP-FPM has already called fastcgi_finish_request().
+ * console.terminate fires after a console command.
  *
- * A Messenger worker is one command, so console.terminate comes only when it
- * stops; between its messages the queue is flushed by its kernel.reset tag.
+ * A Messenger worker is one long command, so console.terminate comes only
+ * when it stops. Between its messages, the queue is run through its
+ * kernel.reset tag (see RefreshQueue::reset()).
  *
- * Needs symfony/event-dispatcher. The events are named, not imported, so
- * neither HttpKernel nor Console has to be installed.
+ * Needs symfony/event-dispatcher. The events are written as strings, not
+ * imported as classes, so neither HttpKernel nor Console has to be
+ * installed.
  */
 final class TerminateSubscriber implements EventSubscriberInterface
 {
@@ -36,7 +39,8 @@ final class TerminateSubscriber implements EventSubscriberInterface
      */
     public static function getSubscribedEvents(): array
     {
-        // last: whatever else listens has run, and the client is long gone
+        // priority -1024 runs it last, after every other listener, when the
+        // client is long gone
         return [
             'kernel.terminate' => ['flush', -1024],
             'console.terminate' => ['flush', -1024],

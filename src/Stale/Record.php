@@ -12,15 +12,23 @@ declare(strict_types=1);
 namespace Artigo\Cache\Stale;
 
 /**
- * A value as StaleCache stores it: the value and its three times. Fresh until
- * $freshUntil; served while it is refreshed for $staleFor seconds after that;
- * kept for $errorFor seconds more, to be served only when computing it again
- * fails. The pool holding it keeps it for all three.
+ * A value as StaleCache stores it, together with its three times.
  *
- * The times travel inside the value, so any marshaller carries them - Deflate
- * included - and Symfony's own envelope, which knows one expiry, is left
- * alone. So does $soft: whether the pool that wrote it serves it stale after
- * a tag invalidation too (see SoftWrapper).
+ * - Until $freshUntil it is fresh.
+ * - For $staleFor seconds after that it is stale: served at once while one
+ *   process refreshes it.
+ * - For $errorFor seconds after that it is kept for errors: served only when
+ *   computing it again fails.
+ *
+ * Example: written at 12:00 with a 5 minute lifetime, $staleFor 60 and
+ * $errorFor 600. It is fresh until 12:05, served stale until 12:06, and kept
+ * for errors until 12:16. The pool that holds it keeps it until 12:16.
+ *
+ * The times are stored inside the value, so any marshaller carries them,
+ * DeflateMarshaller included, and Symfony's own envelope, which has room for
+ * only one expiry, is left alone. $soft is stored the same way: it says
+ * whether the pool that wrote the value serves it stale after a tag
+ * invalidation too (see SoftWrapper).
  *
  * @internal
  */
@@ -39,8 +47,9 @@ final class Record
     }
 
     /**
-     * The same value, its lifetime ended at $at at the latest: what a tag
-     * invalidation at $at leaves of it.
+     * A copy whose lifetime ends at $at, or earlier if it already ended. This
+     * is what a soft tag invalidation at $at leaves of the value: it is stale
+     * from that moment.
      */
     public function endedAt(float $at): self
     {
@@ -69,7 +78,8 @@ final class Record
     }
 
     /**
-     * When the pool may let it go: once it can no longer be served at all.
+     * When the pool may delete it: the moment it can no longer be served at
+     * all.
      */
     public function keptUntil(): float
     {
@@ -97,8 +107,8 @@ final class Record
     }
 
     /**
-     * A time read back, and a missing or mangled one as none at all: stale
-     * at once and kept for nothing, so it is computed again.
+     * Reads a time back from the stored data. A missing or broken time
+     * becomes 0, so the value counts as long expired and is computed again.
      */
     private static function time(mixed $time): float
     {

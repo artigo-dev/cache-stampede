@@ -14,10 +14,17 @@ namespace Artigo\Cache;
 use Artigo\Cache\Exception\LockUnavailable;
 
 /**
- * Pushes a held lock's expiry out, for work that may outrun it.
+ * Lets work that holds a lock push the lock's expiry further out.
  *
- * Handed to the closure doing the work, so the token stays where it belongs
- * and only whoever holds the lock can extend it:
+ * A lock expires after its TTL, so that a holder that dies does not block
+ * everybody forever. But long work can outlive the TTL. Example: an import
+ * holds a 30 second lock but needs two minutes. After 30 seconds the lock
+ * expires, and the next worker starts the same import beside it. With a
+ * KeepAlive the work calls it as it goes, and each call moves the expiry a
+ * full TTL out from now.
+ *
+ * It is handed to the closure doing the work. So the lock's token stays in
+ * here, and only the holder can extend the lock:
  *
  *     $lock->exclusively('import', function (KeepAlive $keepAlive) use ($rows) {
  *         foreach ($rows as $row) {
@@ -26,21 +33,21 @@ use Artigo\Cache\Exception\LockUnavailable;
  *         }
  *     });
  *
- * The extension is one command - `SET key token PX ttl IFEQ token`, Redis
- * 8.4 and Valkey 8.1, or a compare-and-PEXPIRE script on servers without it
- * (see RedisCommand) - which rewrites the lock only while it still carries
- * our token. A lock that expired and was taken by somebody else carries
- * theirs, and is left to them.
+ * The extension is one command: `SET key token PX ttl IFEQ token` on Redis
+ * 8.4 and Valkey 8.1, or on older servers a small script that compares the
+ * token and then runs PEXPIRE (see RedisCommand). Either way the lock is
+ * changed only while it still holds our token. If it expired and somebody
+ * else took it, it holds their token, and it is left alone.
  *
- * It throws rather than answering false, for the reason
- * {@see MemoLock::exclusively()} throws and `symfony/lock`'s `refresh()` does:
- * carrying on after the lock has gone is the one outcome a caller who asked
- * for exclusivity cannot use, and a return value is too easy not to read.
+ * It throws when the lock is gone, instead of returning false. That is the
+ * same reason {@see MemoLock::exclusively()} throws and `symfony/lock`'s
+ * `refresh()` does: a caller who asked to run alone cannot use a run that
+ * carries on without the lock, and a return value is too easy to ignore.
  */
 final class KeepAlive
 {
     /**
-     * @internal built by MemoLock, which is the only thing holding the token
+     * @internal created by MemoLock, the only code that knows the lock's token
      */
     public function __construct(
         private readonly \Redis|\RedisArray|\RedisCluster|\Relay\Relay|\Relay\Cluster|null $redis,
@@ -52,12 +59,12 @@ final class KeepAlive
     }
 
     /**
-     * For work running without a lock at all.
+     * A KeepAlive for work that runs without any lock.
      *
-     * {@see MemoLock::once()} does the work anyway when the lock cannot be
-     * reached or never frees, because a duplicated render beats a failed
-     * request. The closure still asks for a keep-alive; there is nothing to
-     * keep alive, and nothing to lose by saying so quietly.
+     * {@see MemoLock::once()} still does the work when the lock cannot be
+     * reached or is never released, because rendering something twice is
+     * better than a failed request. The closure may still call its KeepAlive.
+     * There is no lock to extend, so the call quietly does nothing.
      */
     public static function unheld(string $key): self
     {
@@ -72,7 +79,7 @@ final class KeepAlive
     public function __invoke(?int $ttlMs = null): void
     {
         if (null === $this->redis) {
-            // nothing is held: this work is running unprotected and knows it
+            // no lock is held: this work already runs without one, and knows it
             return;
         }
 

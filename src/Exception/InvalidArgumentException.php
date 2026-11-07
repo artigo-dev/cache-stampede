@@ -14,8 +14,8 @@ namespace Artigo\Cache\Exception;
 use Symfony\Component\Cache\Exception\InvalidArgumentException as SymfonyInvalidArgumentException;
 
 /**
- * Extends Symfony's exception so callers already catching the component's
- * hierarchy keep catching ours.
+ * Extends Symfony Cache's InvalidArgumentException, so code that already
+ * catches Symfony's cache exceptions catches this one too.
  */
 class InvalidArgumentException extends SymfonyInvalidArgumentException
 {

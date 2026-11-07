@@ -14,13 +14,19 @@ namespace Artigo\Cache\Stale;
 /**
  * Picks the one process that refreshes a stale value, without making anyone
  * wait: whoever does not win serves the stale value and moves on.
+ *
+ * Example: twelve requests read the same stale value at once. One of them
+ * wins and refreshes it; the other eleven serve the stale value and do not
+ * wait. MemoLock and FleetLock pick one process across all servers.
+ * FlockElection picks one per server.
  */
 interface Election
 {
     /**
-     * Takes the refresh of $key if nobody holds it, for at most $ttlMs.
+     * Takes the right to refresh $key if nobody else holds it, for at most
+     * $ttlMs.
      *
-     * @return (\Closure(): void)|null the release, or null when another holds it
+     * @return (\Closure(): void)|null a closure that releases it, or null when another process holds it
      *
      * @throws \Throwable when the lock cannot be reached; StaleCache then refreshes nothing
      *

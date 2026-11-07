@@ -12,14 +12,15 @@ declare(strict_types=1);
 namespace Artigo\Cache\Exception;
 
 /**
- * Exclusivity was asked for and could not be given.
+ * Thrown when a caller asked to run alone, and that could not be guaranteed.
  *
- * Everything else in this package degrades quietly: a cache that cannot take a
- * lock computes anyway, because a duplicated computation is worse than a
- * missing one but far better than a failed request. {@see MemoLock::exclusively()}
- * cannot do that. A caller who asked that two workers never run something at
- * the same time would rather hear that it did not happen than be told nothing
- * while it happens twice.
+ * Everything else in this package carries on without the lock: a cache that
+ * cannot take a lock computes the value anyway, because computing it twice
+ * is far better than a failed request. {@see MemoLock::exclusively()} cannot
+ * do that. A caller who asked that two workers never run something at the
+ * same time would rather hear that it did not run than have it run twice
+ * without being told. A KeepAlive throws it too, when the lock it should
+ * extend has expired or cannot be reached.
  */
 final class LockUnavailable extends \RuntimeException
 {
