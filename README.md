@@ -294,8 +294,8 @@ holder — 2 ms more than `MemoLock`'s own, a hundred less than the poll, with n
 Redis command of their own in the cache.
 
 So `FleetLock` on this store inherits the wake-up with no Redis code of its
-own. That is the shape this would take inside `symfony/lock`, and the reason
-`MemoLock` need not become a class of the Cache component.
+own. The wake-up can therefore live in either place: in `MemoLock`, at 4 ms,
+or inside `symfony/lock`, at 7 ms, where every Lock user would get it.
 
 **How it works.** Like `MemoLock`, it needs a second connection for the
 blocking `SUBSCRIBE`; `PubSubRedisStore::fromDsn()` opens both. A blocking
@@ -755,6 +755,11 @@ php benchmarks/stampede.php workers=12 resolverMs=300 hosts=12
 three calls; twelve hosts, twelve. Its lock files are local, so a second machine
 cannot see them. Note the last row of its own block: twelve hosts looks *fast*
 only because nobody is waiting for anybody.
+
+How long the others wait for the one that computes, with the Lock component's
+waiters woken by a message too ([`FleetLock` on `PubSubRedisStore`](#pubsubredisstore-the-wake-up-on-the-lock-components-side)):
+
+![How long the others wait for the one that computes](docs/wait.png)
 
 ### Different keys that happen to share a lock file
 

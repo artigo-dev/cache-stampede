@@ -10,7 +10,7 @@ declare(strict_types=1);
  */
 
 /*
- * Draws the two pictures the numbers are for, into docs/.
+ * Draws the three pictures the numbers are for, into docs/.
  *
  *   php benchmarks/charts.php
  *
@@ -47,6 +47,19 @@ const FALSE_SHARING = [
     ],
 ];
 
+/*
+ * php benchmarks/stampede.php workers=12 resolverMs=300 modes=memolock,fleetlock-pubsub,symfony-onehost,fleetlock
+ * Twelve concurrent misses on one cold key, each lock letting one of them
+ * compute. Milliseconds the other eleven were served after the 300 ms the
+ * computation took, the middle of three runs.
+ */
+const WAIT = [
+    ['name' => 'MemoLock', 'colour' => '#3ddc97', 'value' => 4],
+    ['name' => 'FleetLock on PubSubRedisStore', 'colour' => '#3ddc97', 'value' => 7],
+    ['name' => 'LockRegistry', 'colour' => '#ff6b6b', 'value' => 101],
+    ['name' => 'FleetLock on RedisStore', 'colour' => '#ff6b6b', 'value' => 108],
+];
+
 $out = \dirname(__DIR__).'/docs';
 
 if (!is_dir($out) && !mkdir($out, 0o777, true) && !is_dir($out)) {
@@ -71,7 +84,13 @@ file_put_contents($out.'/false-sharing.svg', chart(
     format: static fn (float $v): string => number_format($v),
 ));
 
-echo 'wrote docs/stampede.svg and docs/false-sharing.svg'.\PHP_EOL;
+file_put_contents($out.'/wait.svg', bars(
+    'How long the others wait for the one that computes',
+    'milliseconds beyond the 300 ms computation, twelve requests for one cold key',
+    WAIT,
+));
+
+echo 'wrote docs/stampede.svg, docs/false-sharing.svg and docs/wait.svg'.\PHP_EOL;
 
 /**
  * @param array{labels: list<string>, series: list<array{name: string, colour: string, values: list<int>}>} $data
@@ -180,6 +199,57 @@ function chart(string $title, string $axis, array $data, bool $logarithmic, \Clo
     }
 
     $svg[] = \sprintf('<text x="%.1f" y="%.1f" font-size="11.5" fill="#8b8ba7" text-anchor="middle">%s</text>', $left + $plotWidth / 2, $height - 16, e($axis));
+    $svg[] = '</svg>';
+
+    return implode("\n", $svg)."\n";
+}
+
+/**
+ * One bar per row, the name before it and the value after it, on a common
+ * scale from zero.
+ *
+ * @param list<array{name: string, colour: string, value: int}> $rows
+ */
+function bars(string $title, string $axis, array $rows): string
+{
+    $width = 760;
+    $height = 380;
+    // the names sit right-aligned before the bars, the values after them
+    $names = 262;
+    $right = 84;
+    $top = 70;
+    $bottom = 64;
+
+    $plotWidth = $width - $names - $right;
+    $plotHeight = $height - $top - $bottom;
+    $max = (float) max(array_column($rows, 'value'));
+    $step = $plotHeight / \count($rows);
+    $thickness = min(28.0, $step * 0.55);
+    $x = static fn (float $value): float => $names + $value / $max * $plotWidth;
+
+    $svg = [];
+    $svg[] = \sprintf('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d" font-family="Rajdhani, system-ui, -apple-system, Segoe UI, sans-serif">', $width, $height, $width, $height);
+    $svg[] = '<style>@font-face { font-family: "Rajdhani"; font-weight: 600; src: url("src/fonts/rajdhani-600.woff2") format("woff2"); }'
+        .'@font-face { font-family: "Rajdhani"; font-weight: 700; src: url("src/fonts/rajdhani-700.woff2") format("woff2"); }</style>';
+    $svg[] = \sprintf('<rect width="%d" height="%d" fill="#0a0a12"/>', $width, $height);
+    $svg[] = \sprintf('<text x="38" y="32" font-size="17" font-weight="600" fill="#e8e8f0">%s</text>', e($title));
+
+    // gridlines every quarter of the scale, numbered under the bars
+    $tick = max(1, (int) ceil($max / 4 / 25) * 25);
+
+    for ($value = 0; $value <= $max; $value += $tick) {
+        $svg[] = \sprintf('<line x1="%.1f" y1="%d" x2="%.1f" y2="%d" stroke="#1c1c2a" stroke-width="1"/>', $x((float) $value), $top - 8, $x((float) $value), $top + $plotHeight);
+        $svg[] = \sprintf('<text x="%.1f" y="%d" font-size="11" fill="#8b8ba7" text-anchor="middle">%d</text>', $x((float) $value), $top + $plotHeight + 20, $value);
+    }
+
+    foreach ($rows as $index => $row) {
+        $middle = $top + $step * ($index + 0.5);
+        $svg[] = \sprintf('<rect x="%d" y="%.1f" width="%.1f" height="%.1f" rx="3" fill="%s"/>', $names, $middle - $thickness / 2, max(2.0, $x((float) $row['value']) - $names), $thickness, $row['colour']);
+        $svg[] = \sprintf('<text x="%d" y="%.1f" font-size="13" font-weight="600" fill="%s" text-anchor="end">%s</text>', $names - 12, $middle + 5, $row['colour'], e($row['name']));
+        $svg[] = \sprintf('<text x="%.1f" y="%.1f" font-size="13" font-weight="700" fill="%s">%d ms</text>', $x((float) $row['value']) + 8, $middle + 5, $row['colour'], $row['value']);
+    }
+
+    $svg[] = \sprintf('<text x="%.1f" y="%d" font-size="11.5" fill="#8b8ba7" text-anchor="middle">%s</text>', $names + $plotWidth / 2, $height - 16, e($axis));
     $svg[] = '</svg>';
 
     return implode("\n", $svg)."\n";
