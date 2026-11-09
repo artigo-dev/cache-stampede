@@ -771,17 +771,22 @@ number of concurrent processes."* So one machine can compute **24 distinct keys
 at once** on Symfony 8.1, and the 25th waits for work it has nothing to do with.
 
 Distinct cold keys chosen to share a slot, 300 ms to compute each. All of them
-genuinely need computing, so the lock saves nothing here and only lines them up:
+genuinely need computing, so the lock saves nothing here and only lines them up.
+`MemoLock` and `FleetLock` lock each key on its own, so nothing waits:
 
-| unrelated keys | `LockRegistry` | one lock per key |
-|---|---|---|
-| 2 | 0.702 s | **0.302 s** |
-| 4 | 1.502 s | **0.302 s** |
-| 6 | 2.303 s | **0.302 s** |
-| 8 | 3.105 s | **0.302 s** |
+| unrelated keys | `LockRegistry` | `MemoLock` | `FleetLock` |
+|---|---|---|---|
+| 2 | 0.702 s | 0.302 s | 0.302 s |
+| 4 | 1.503 s | 0.302 s | 0.303 s |
+| 6 | 1.904 s | 0.302 s | 0.303 s |
+| 8 | 3.105 s | 0.303 s | 0.303 s |
+
+The middle of three runs. `LockRegistry`'s waiters find the file free on their
+next 100 ms poll, so its times move from run to run: six keys took 1.81, 1.90
+and 2.30 s.
 
 ```bash
-php benchmarks/stampede.php workers=8 resolverMs=300 keys=collide
+php benchmarks/stampede.php workers=8 resolverMs=300 keys=collide modes=symfony-onehost,memolock,fleetlock
 ```
 
 ![Unrelated keys sharing a LockRegistry slot](docs/false-sharing.png)
