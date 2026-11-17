@@ -574,6 +574,13 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
             // pool's lock still applies
             $refreshed = $this->inner->get($key, $this->wrap($key, $callback, false, null, true), \INF);
 
+            if (null !== $kept) {
+                // the attempt succeeded, so the failure is over: forgotten,
+                // or a value the callback chose not to store ($save = false)
+                // would leave the old value served until the next attempt
+                $this->forget($key);
+            }
+
             return $refreshed instanceof Record ? $refreshed : null;
         } catch (\Throwable $e) {
             $this->logger?->error('Refreshing "{key}" failed; its stale value stays: {message}', ['key' => $key, 'message' => $e->getMessage(), 'exception' => $e]);
@@ -644,10 +651,11 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
      * Remembers that computing $key failed just now. It is kept for
      * $errorRetrySeconds and the time a refresh may hold its election. The
      * next attempt starts within that time and remembers itself as it
-     * starts, so it never ends to find the failure forgotten. Nothing
-     * deletes a remembered failure: it stops counting when a new value is
-     * stored (see failureOf()), and expires. If the failure cannot be
-     * stored, the next read computes again, as if nothing had failed.
+     * starts, so it never ends to find the failure forgotten. An attempt
+     * that succeeds deletes it (see forget()); otherwise it stops counting
+     * when a new value is stored (see failureOf()), and expires. If the
+     * failure cannot be stored, the next read computes again, as if nothing
+     * had failed.
      */
     private function failed(string $key): void
     {
@@ -657,6 +665,23 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
             $this->inner->save($item);
         } catch (\Throwable $e) {
             $this->logger?->warning('Could not remember that computing "{key}" failed: {message}', ['key' => $key, 'message' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * Forgets the failure remembered for $key, after an attempt that
+     * succeeded. A value it stored makes the failure stop counting anyway;
+     * a value the callback did not store ($save = false) would otherwise
+     * leave the old value served to every other request until the next
+     * attempt, though the origin answers. Forgotten, the next read computes,
+     * as with no failure. If it cannot be deleted, it expires.
+     */
+    private function forget(string $key): void
+    {
+        try {
+            $this->inner->deleteItem(self::failedKey($key));
+        } catch (\Throwable $e) {
+            $this->logger?->warning('Could not forget that computing "{key}" failed: {message}', ['key' => $key, 'message' => $e->getMessage()]);
         }
     }
 

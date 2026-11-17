@@ -680,7 +680,9 @@ once, with `METADATA_STALE`, and nobody computes what just failed. Once
 `errorRetrySeconds` (1) have passed, one process is elected to try again, the
 way a stale value is refreshed — after the response with a deferrer — and the
 others keep serving the old article. An attempt that fails is remembered anew;
-one that succeeds stores the new value, and the next read is a hit. So past
+one that succeeds forgets the failure and stores the new value, so the next
+read is a hit - or, when the callback chose not to store it (`$save = false`),
+computes again, as with no failure. So past
 the stale time a failing origin is asked once per `errorRetrySeconds` for each
 key that is read, and a recovered origin is picked up within
 `errorRetrySeconds` and one computation.

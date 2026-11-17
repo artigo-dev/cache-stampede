@@ -202,6 +202,43 @@ final class StaleIfErrorTest extends TestCase
         self::assertArrayNotHasKey(StaleCache::METADATA_STALE, $metadata);
     }
 
+    public function testARetryWhoseValueIsNotStoredForgetsTheFailure(): void
+    {
+        $this->store('old', microtime(true) - 70, 60, 600);
+        $this->remember(microtime(true) - 5);
+        $pool = $this->pool(600);
+        // the origin answers again, with a value the application does not cache
+        $unsaved = static function (ItemInterface $item, bool &$save): string {
+            $save = false;
+
+            return 'new';
+        };
+
+        self::assertSame('new', $pool->get('k', $unsaved), 'the winner serves what it computed');
+        self::assertNull($this->remembered(), 'and the failure is forgotten');
+        self::assertSame('new', $pool->get('k', $unsaved), 'so the next read computes, as with no failure');
+    }
+
+    public function testWithADeferrerARetryWhoseValueIsNotStoredForgetsTheFailure(): void
+    {
+        $this->store('old', microtime(true) - 70, 60, 600);
+        $this->remember(microtime(true) - 5);
+        $queue = new RefreshQueue();
+        $pool = $this->pool(600);
+        $pool->setDeferrer($queue);
+        $unsaved = static function (ItemInterface $item, bool &$save): string {
+            $save = false;
+
+            return 'new';
+        };
+
+        self::assertSame('old', $pool->get('k', $unsaved), 'served at once, the attempt after the response');
+        $queue->flush();
+
+        self::assertNull($this->remembered());
+        self::assertSame('new', $pool->get('k', $unsaved), 'the next read gets what the origin answers');
+    }
+
     public function testAFailureFromBeforeTheValueWasStoredDoesNotCount(): void
     {
         // the failure is older than the end of the value's lifetime: it was
