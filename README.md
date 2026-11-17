@@ -658,22 +658,66 @@ services:
 ### Stale-if-error
 
 **The setup.** Past its stale time a value is computed like a miss, by the
-request that reads it.
+request that reads it: the stale time is the oldest value you accept while the
+origin answers.
 
 **The question.** What is served when that computation fails — the database
-is down, the API times out?
+is down, the API times out — and what does every request after it cost?
 
 **Example.** `article-42` was fresh for five minutes and servable for one
-more; `staleIfErrorSeconds` is 600. Seven minutes after it was written a
-request reads it and the origin throws.
+more; `staleIfErrorSeconds` is 600. Seven minutes after it was written ten
+requests read it at once, and the origin throws after 500 ms.
 
 - **`staleIfErrorSeconds: 0`:** the exception reaches the caller.
-- **`staleIfErrorSeconds: 600`:** the old article is served, the failure
-  logged, and the next read tries again; after the 600 seconds the exception
-  reaches the caller.
+- **`staleIfErrorSeconds: 600`:** one request computes, fails, and is served
+  the old article. The failure is logged and remembered. The nine requests
+  that waited behind it are served the old article as soon as it has failed;
+  none of them computes. After the 600 seconds the exception reaches the
+  caller.
+
+**While the failure is remembered** the value is served like a stale one: at
+once, with `METADATA_STALE`, and nobody computes what just failed. Once
+`errorRetrySeconds` (1) have passed, one process is elected to try again, the
+way a stale value is refreshed — after the response with a deferrer — and the
+others keep serving the old article. An attempt that fails is remembered anew;
+one that succeeds stores the new value, and the next read is a hit. So past
+the stale time a failing origin is asked once per `errorRetrySeconds` for each
+key that is read, and a recovered origin is picked up within
+`errorRetrySeconds` and one computation.
+
+Measured through nginx and php-fpm, on versioned-cache with `MemoLock`, with a
+computation that throws after 500 ms:
+
+| 10 concurrent reads, past the stale time | Computations | Median | Max |
+|---|---|---|---|
+| 2.0 | 10, one after another | 3.0 s | 5.0 s |
+| 2.1, the first failure | 1 | 0.52 s | 0.52 s |
+| 2.1, any read in the second after it | 0 | 10 ms | 10 ms |
+
+**What it never does.** It never serves the kept value in place of a
+computation that would succeed: with no failure remembered, a read past the
+stale time computes, and the requests beside it wait for that value, as for
+any miss. A failure counts only for the value it was about. One remembered
+before the value was stored — a refresh failed, the next one succeeded — is
+ignored. A value past `staleIfErrorSeconds`, a deleted one, and one a hard
+invalidation reached are never served, whatever is remembered.
+
+**Where the failure is kept.** In the inner pool, under a key of its own:
+`stale.failed.` and a hash of the value's key, a float, for
+`errorRetrySeconds` plus the refresh lock's TTL. It is written on a failure
+only, and read only for a value past its stale time, so a hit, a miss and a
+stale read cost what they did. A refresh of a stale value that fails is
+remembered too. Inside the stale time that changes nothing — a stale read is
+served at once and may refresh, as before — but when the stale time ends
+during an outage, nobody has to compute to find out.
+
+**The log.** Each failed computation is logged once, as a warning with the
+exception. Symfony's default logger, without Monolog, drops warnings in
+`prod`: give the pool a logger that keeps them, or the outage is silent.
 
 So a value is kept for `staleIfErrorSeconds` after its stale time, to be
-served only when computing it again fails.
+served only when computing it again fails, and a failing origin costs one
+computation per retry time, not one per request.
 
 ## Soft serving: after a tag invalidation, too
 

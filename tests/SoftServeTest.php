@@ -96,6 +96,40 @@ final class SoftServeTest extends TestCase
         self::assertSame('before', $value, 'computed at once, and kept for its failure');
     }
 
+    public function testASoftValueKeptForErrorsIsServedAtOnceWhileItsFailureIsRemembered(): void
+    {
+        $pool = $this->pool(staleSeconds: 0, staleIfErrorSeconds: 600);
+        $pool->get('menu', $this->compute('before'));
+        self::assertTrue($pool->invalidateTags(['menu']));
+
+        $failed = 0;
+        $down = self::counting($failed);
+
+        self::assertSame('before', $this->pool(staleSeconds: 0, staleIfErrorSeconds: 600)->get('menu', $down));
+        self::assertSame(1, $failed);
+
+        $value = $this->pool(staleSeconds: 0, staleIfErrorSeconds: 600)->get('menu', $down, metadata: $metadata);
+
+        self::assertSame('before', $value);
+        self::assertSame(1, $failed, 'the read after the failure computes nothing');
+        self::assertIsArray($metadata);
+        self::assertTrue($metadata[StaleCache::METADATA_STALE] ?? false);
+    }
+
+    public function testARememberedFailureDoesNotBringBackWhatAHardInvalidationRemoved(): void
+    {
+        $pool = $this->pool(staleSeconds: 0, staleIfErrorSeconds: 600);
+        $pool->get('menu', $this->compute('before'));
+        self::assertTrue($pool->invalidateTags(['menu']));
+        self::assertSame('before', $this->pool(staleSeconds: 0, staleIfErrorSeconds: 600)->get('menu', self::down()), 'failed, and remembered');
+
+        self::assertTrue($this->pool()->invalidateTags(['menu'], hard: true));
+
+        $this->expectExceptionMessage('the origin is down');
+
+        $this->pool(staleSeconds: 0, staleIfErrorSeconds: 600)->get('menu', self::down());
+    }
+
     public function testAHardInvalidationIsNeverServedStale(): void
     {
         $this->pool()->get('menu', $this->compute('before'));
@@ -152,6 +186,18 @@ final class SoftServeTest extends TestCase
         $inner = new $versioned($this->redis, $this->namespace, rulesCacheMs: 0, rulesCache: false, softGraceSeconds: 600); // @phpstan-ignore class.notFound (installed or not, see setUp())
 
         return $inner;
+    }
+
+    /**
+     * A callback that counts its calls in $failed and throws.
+     */
+    private static function counting(int &$failed): \Closure
+    {
+        return static function () use (&$failed): string {
+            ++$failed;
+
+            throw new \RuntimeException('the origin is down');
+        };
     }
 
     private static function down(): \Closure

@@ -66,8 +66,10 @@ use Symfony\Contracts\Service\ResetInterface;
  *   With a deferrer the refresh runs after the response (see RefreshQueue).
  *   Without one it runs at once, and the caller gets the new value.
  * - **Kept for errors** (up to $staleIfErrorSeconds after that): computed
- *   now, like a miss. If that throws, the old value is served and the
- *   failure is logged.
+ *   now, like a miss. If that throws, the old value is served, and the
+ *   failure is logged and remembered. While it is remembered, the old value
+ *   is served at once, as a stale one is, and one process tries again every
+ *   $errorRetrySeconds, until a computation succeeds.
  * - **Gone**: a miss, computed by the inner pool and its callback wrapper.
  *
  * A refresh is the inner pool's forced get() (INF), so it goes through the
@@ -75,6 +77,26 @@ use Symfony\Contracts\Service\ResetInterface;
  * the key is deleted while the refresh computes, the refresh's write is
  * refused. A refresh that throws keeps the stale value. An invalidated value
  * is never served stale, because the inner pool answers a miss for it.
+ *
+ * A computation that failed is remembered in the inner pool, under a key of
+ * its own (FAILED_PREFIX and a hash of the value's key), for
+ * $errorRetrySeconds and the time a refresh may hold its election. Example:
+ * the database goes down at 12:00:00 and a report is past its stale time.
+ * The request that reads it computes, fails after 500 ms, and gets the old
+ * report. Nine requests that waited behind it get the old report as soon as
+ * it has failed, and compute nothing. For the next second every request
+ * gets the old report at once. Then one request is elected to try again,
+ * after its response if there is a deferrer, and so on, once a second, until
+ * the database answers. So past the stale time a failing origin is asked
+ * once per $errorRetrySeconds, not once per request, and no request waits
+ * for a computation that has just failed.
+ *
+ * A refresh of a stale value that fails is remembered the same way. Inside
+ * the stale time that changes nothing: a stale read is served at once and
+ * may refresh, as before. But when the stale time ends during an outage, the
+ * failure is already known, and nobody has to compute to find out. With no
+ * failure remembered, the kept value is never served: a read past the stale
+ * time computes, and the requests beside it wait for the new value.
  *
  * The inner pool is this pool's storage. What it holds are Records, so read
  * them through this pool, not directly. This pool's PSR-6 methods are
@@ -95,6 +117,12 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
      */
     public const METADATA_STALE = 'stale';
 
+    /**
+     * The inner pool's key of a remembered failure starts with this; a hash
+     * of the value's key follows.
+     */
+    public const FAILED_PREFIX = 'stale.failed.';
+
     private readonly Election $election;
 
     /** @var (\Closure(\Closure(): void, string): mixed)|null takes the refresh and its key */
@@ -114,9 +142,10 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
     private readonly \Closure $unpackItem;
 
     /**
-     * @param CacheItemPoolInterface&CacheInterface $inner           where the Records are kept
-     * @param int                                   $defaultLifetime the lifetime in seconds of a value whose callback sets none; 0 means no lifetime, so such a value never turns stale
-     * @param bool                                  $soft            whether the values this pool writes are served stale after a tag invalidation too
+     * @param CacheItemPoolInterface&CacheInterface $inner             where the Records are kept
+     * @param int                                   $defaultLifetime   the lifetime in seconds of a value whose callback sets none; 0 means no lifetime, so such a value never turns stale
+     * @param bool                                  $soft              whether the values this pool writes are served stale after a tag invalidation too
+     * @param int                                   $errorRetrySeconds how long after a computation failed the next one may start; with 0 the next read may try again
      */
     public function __construct(
         private readonly CacheItemPoolInterface&CacheInterface $inner,
@@ -126,8 +155,9 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
         private readonly int $defaultLifetime = 0,
         private readonly int $refreshLockTtlMs = 30_000,
         private readonly bool $soft = false,
+        private readonly int $errorRetrySeconds = 1,
     ) {
-        foreach (['staleSeconds' => $staleSeconds, 'staleIfErrorSeconds' => $staleIfErrorSeconds, 'defaultLifetime' => $defaultLifetime] as $name => $value) {
+        foreach (['staleSeconds' => $staleSeconds, 'staleIfErrorSeconds' => $staleIfErrorSeconds, 'defaultLifetime' => $defaultLifetime, 'errorRetrySeconds' => $errorRetrySeconds] as $name => $value) {
             if ($value < 0) {
                 throw new InvalidArgumentException(\sprintf('Argument "$%s" must not be negative, %d given.', $name, $value));
             }
@@ -266,23 +296,52 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
             return $record->value;
         }
 
+        $kept = $record->isKeptForErrors($now) ? $record : null;
+
+        // past the stale time, kept for errors, and computing it failed a
+        // moment ago, here or in another process: serve the old value at
+        // once, as a stale one is served. Once $errorRetrySeconds have
+        // passed, one process tries again (see refresh())
+        if (null !== $kept && null !== $failedAt = $this->failedAt($key, $kept)) {
+            $refreshed = $now - $failedAt < $this->errorRetrySeconds ? null : $this->schedule($key, $callback, $kept);
+
+            if (null !== $refreshed) {
+                self::describe($metadata, $refreshed, false);
+
+                return $refreshed->value;
+            }
+
+            self::describe($metadata, $kept, true);
+
+            return $kept->value;
+        }
+
         // past the stale time: compute it now, like a miss. INF forces the
         // computation, because the inner pool still holds the old Record. If
         // another process stored a fresh value while this one waited for the
-        // inner pool's lock, wrap() takes that one instead
+        // inner pool's lock, wrap() takes that one instead. If another
+        // process computed and failed meanwhile, wrap() hands $kept back
         try {
-            $computed = $this->inner->get($key, $this->wrap($key, $callback, true), \INF, $metadata);
+            $computed = $this->inner->get($key, $this->wrap($key, $callback, true, $kept, null !== $kept), \INF, $metadata);
         } catch (\Throwable $e) {
             // the computation failed: serve the old value if it is still kept
             // for errors, otherwise let the exception through
-            if (!$record->isKeptForErrors($now)) {
+            if (null === $kept) {
                 throw $e;
             }
 
             $this->logger?->warning('Computing "{key}" failed; its stale value is served: {message}', ['key' => $key, 'message' => $e->getMessage(), 'exception' => $e]);
-            self::describe($metadata, $record, true);
+            self::describe($metadata, $kept, true);
 
-            return $record->value;
+            return $kept->value;
+        }
+
+        if (null !== $kept && $computed === $kept) {
+            // the process this one waited for failed, and nothing was
+            // computed here
+            self::describe($metadata, $kept, true);
+
+            return $kept->value;
         }
 
         if (!$computed instanceof Record) {
@@ -390,28 +449,52 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
      *
      * With $reuseFresh, it first reads the inner pool. If another process
      * stored a fresh value while this one waited for the inner pool's lock,
-     * that value is used as it is, instead of computing it again.
+     * that value is used as it is, instead of computing it again. With $kept
+     * too, the same read looks for a failure. If another process computed
+     * and failed while this one waited, $kept is handed back as it is and
+     * the callback is not called. So the requests that waited behind a
+     * failing computation do not repeat it one after another.
+     *
+     * With $remember, a callback that throws is remembered (see failed())
+     * before the exception goes on. That happens here, inside the inner
+     * pool's lock, so the failure is stored before the lock is released and
+     * the next request that takes the lock finds it.
      *
      * @return \Closure(ItemInterface, bool): mixed
      */
-    private function wrap(string $key, callable $callback, bool $reuseFresh): \Closure
+    private function wrap(string $key, callable $callback, bool $reuseFresh, ?Record $kept = null, bool $remember = false): \Closure
     {
-        return function (ItemInterface $item, bool &$save) use ($key, $callback, $reuseFresh): mixed {
+        return function (ItemInterface $item, bool &$save) use ($key, $callback, $reuseFresh, $kept, $remember): mixed {
             if ($reuseFresh) {
-                $current = $this->inner->getItem($key);
-                $record = $current->isHit() ? $current->get() : null;
+                [$record, $failedAt] = $this->look($key, $kept);
 
-                if ($record instanceof Record && $record->isFresh(microtime(true))) {
+                if (null !== $record && $record->isFresh(microtime(true))) {
                     // already stored, with its tags, so there is nothing to save
                     $save = false;
 
                     return $record;
                 }
+
+                if (null !== $kept && null !== $failedAt) {
+                    // nothing is computed, so there is nothing to save
+                    $save = false;
+
+                    return $kept;
+                }
             }
 
             // compute, and have the inner pool keep the Record for all three
             // of its times (see keep())
-            $value = $callback($item, $save);
+            try {
+                $value = $callback($item, $save);
+            } catch (\Throwable $e) {
+                if ($remember) {
+                    $this->failed($key);
+                }
+
+                throw $e;
+            }
+
             $record = $this->record($value, $item instanceof CacheItem ? ($this->expiryOf)($item) : null);
             $this->keep($item, $record);
 
@@ -422,18 +505,19 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
     /**
      * Without a deferrer, runs the refresh now and returns the fresh Record,
      * or null when this process did not refresh. With a deferrer, hands the
-     * refresh over and returns null.
+     * refresh over and returns null. $kept is the value kept for errors when
+     * the refresh is the next attempt after a failure (see refresh()).
      */
-    private function schedule(string $key, callable $callback): ?Record
+    private function schedule(string $key, callable $callback, ?Record $kept = null): ?Record
     {
         if (null === $this->deferrer) {
-            return $this->refresh($key, $callback);
+            return $this->refresh($key, $callback, $kept);
         }
 
         // the key includes this pool's id, so two pools that share one
         // deferrer each keep their own refresh of the same cache key
-        ($this->deferrer)(function () use ($key, $callback): void {
-            $this->refresh($key, $callback);
+        ($this->deferrer)(function () use ($key, $callback, $kept): void {
+            $this->refresh($key, $callback, $kept);
         }, $key.'@'.$this->poolHash);
 
         return null;
@@ -443,10 +527,15 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
      * Refreshes one value, if this process wins the election. It looks at the
      * stored value first, because another process may have refreshed it
      * meanwhile. Only then does it compute, through the inner pool's forced
-     * get(). A refresh that fails keeps the stale value. The election's lock
-     * is released either way.
+     * get(). A refresh that fails keeps the stale value and is remembered
+     * (see failed()). The election's lock is released either way.
+     *
+     * With $kept, the refresh is the next attempt after a failure, for a
+     * value past its stale time. The look then reads the failure too, in the
+     * same round trip. If another process tried again and failed less than
+     * $errorRetrySeconds ago, nothing is computed.
      */
-    private function refresh(string $key, callable $callback): ?Record
+    private function refresh(string $key, callable $callback, ?Record $kept = null): ?Record
     {
         try {
             $release = $this->election->tryLock($key, $this->refreshLockTtlMs);
@@ -463,16 +552,27 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
 
         try {
             // look again: another process may have refreshed it since our read
-            $current = $this->inner->getItem($key);
-            $record = $current->isHit() ? $current->get() : null;
+            [$record, $failedAt] = $this->look($key, $kept);
 
-            if ($record instanceof Record && $record->isFresh(microtime(true))) {
+            if (null !== $record && $record->isFresh(microtime(true))) {
                 return $record;
+            }
+
+            if (null !== $kept) {
+                // another process tried again and failed since our read
+                if (null !== $failedAt && microtime(true) - $failedAt < $this->errorRetrySeconds) {
+                    return null;
+                }
+
+                // remembered from now, so that it stays remembered for as
+                // long as this attempt may take. Until it ends, every other
+                // request serves the old value and none waits for this one
+                $this->failed($key);
             }
 
             // compute through the inner pool's forced get(), so that the inner
             // pool's lock still applies
-            $refreshed = $this->inner->get($key, $this->wrap($key, $callback, false), \INF);
+            $refreshed = $this->inner->get($key, $this->wrap($key, $callback, false, null, true), \INF);
 
             return $refreshed instanceof Record ? $refreshed : null;
         } catch (\Throwable $e) {
@@ -487,6 +587,87 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
                 $this->logger?->warning('Could not release the refresh of "{key}": {message}', ['key' => $key, 'message' => $e->getMessage()]);
             }
         }
+    }
+
+    /**
+     * Reads the Record stored under $key and, with $kept, the time computing
+     * it last failed (see failedAt()), both in one round trip to the inner
+     * pool.
+     *
+     * @return array{?Record, ?float} the Record, or null when the key holds none; the Unix time of the failure, or null when none is remembered
+     */
+    private function look(string $key, ?Record $kept): array
+    {
+        $failedKey = self::failedKey($key);
+        $record = $failedAt = null;
+
+        foreach ($this->inner->getItems(null === $kept ? [$key] : [$key, $failedKey]) as $itemKey => $item) {
+            $value = $item instanceof CacheItemInterface && $item->isHit() ? $item->get() : null;
+
+            if ($failedKey === $itemKey) {
+                $failedAt = null === $kept ? null : self::failureOf($value, $kept);
+            } elseif ($value instanceof Record) {
+                $record = $value;
+            }
+        }
+
+        return [$record, $failedAt];
+    }
+
+    /**
+     * When computing the value $kept last failed, as a Unix time, or null
+     * when no failure is remembered for it.
+     */
+    private function failedAt(string $key, Record $kept): ?float
+    {
+        $item = $this->inner->getItem(self::failedKey($key));
+
+        return $item->isHit() ? self::failureOf($item->get(), $kept) : null;
+    }
+
+    /**
+     * A remembered failure counts for $kept only if it happened after $kept
+     * stopped being fresh. That is when $kept is computed again: by a
+     * refresh, or by a read past its stale time. An older failure belongs to
+     * a value that was replaced since, so it says nothing about this one.
+     * Example: a refresh fails at 12:00:10, and one succeeds at 12:00:12 and
+     * stores a value fresh until 12:05:12. The failure of 12:00:10 is still
+     * stored, but it is before 12:05:12, so it never counts for the new
+     * value.
+     */
+    private static function failureOf(mixed $failedAt, Record $kept): ?float
+    {
+        return \is_float($failedAt) && $failedAt >= $kept->freshUntil ? $failedAt : null;
+    }
+
+    /**
+     * Remembers that computing $key failed just now. It is kept for
+     * $errorRetrySeconds and the time a refresh may hold its election. The
+     * next attempt starts within that time and remembers itself as it
+     * starts, so it never ends to find the failure forgotten. Nothing
+     * deletes a remembered failure: it stops counting when a new value is
+     * stored (see failureOf()), and expires. If the failure cannot be
+     * stored, the next read computes again, as if nothing had failed.
+     */
+    private function failed(string $key): void
+    {
+        try {
+            $item = $this->inner->getItem(self::failedKey($key))->set(microtime(true));
+            $item->expiresAfter($this->errorRetrySeconds + (int) ceil($this->refreshLockTtlMs / 1000));
+            $this->inner->save($item);
+        } catch (\Throwable $e) {
+            $this->logger?->warning('Could not remember that computing "{key}" failed: {message}', ['key' => $key, 'message' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * The inner pool's key of the failure remembered for $key: a prefix and a
+     * hash of $key, so it is a valid key whatever $key holds and however
+     * long it is.
+     */
+    private static function failedKey(string $key): string
+    {
+        return self::FAILED_PREFIX.hash('xxh128', $key);
     }
 
     /**
