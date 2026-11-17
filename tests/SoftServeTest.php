@@ -101,6 +101,10 @@ final class SoftServeTest extends TestCase
         $pool = $this->pool(staleSeconds: 0, staleIfErrorSeconds: 600);
         $pool->get('menu', $this->compute('before'));
         self::assertTrue($pool->invalidateTags(['menu']));
+        // the aged value's time comes from the Redis server's clock and may
+        // land a millisecond or two after the invalidation: a failure inside
+        // that moment would count as one from before it, and not be remembered
+        usleep(20_000);
 
         $failed = 0;
         $down = self::counting($failed);
