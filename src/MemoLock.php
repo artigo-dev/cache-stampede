@@ -780,11 +780,14 @@ final class MemoLock implements Election
             $logger?->debug('MemoLock stopped waiting on "{channel}": {message}', ['channel' => $channel, 'message' => $e->getMessage()]);
         }
 
-        // When the read times out, ext-redis leaves the connection
-        // subscribed, so we unsubscribe before the next wait uses it. Relay
-        // has already ended the subscription itself, and answers the
-        // unsubscribe with a "Not subscribed" warning, not an exception. The
-        // error handler set here silences that warning.
+        // After a timed-out read the connection must not stay subscribed for
+        // the next wait. What is left of it depends on the client: phpredis
+        // 6.3 drops the socket on the timeout (the next command opens a new
+        // connection, measured for the rg-dev cache talk), Relay has ended
+        // the subscription itself and answers the unsubscribe with a "Not
+        // subscribed" warning, not an exception. Unsubscribing covers any
+        // client that kept it; the error handler set here silences that
+        // warning, and a connection that cannot take the command is closed.
         set_error_handler(static fn (): bool => true);
 
         try {
