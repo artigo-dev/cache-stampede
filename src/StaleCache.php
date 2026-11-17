@@ -283,7 +283,7 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
         // ran at once (no deferrer) and came back with a fresh value, serve
         // that one; otherwise serve the stale value
         if ($record->isServable($now)) {
-            $refreshed = $this->schedule($key, $callback);
+            $refreshed = $this->schedule($key, $callback, null, 0 < $record->errorFor);
 
             if (null !== $refreshed) {
                 self::describe($metadata, $refreshed, false);
@@ -321,8 +321,10 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
         // another process stored a fresh value while this one waited for the
         // inner pool's lock, wrap() takes that one instead. If another
         // process computed and failed meanwhile, wrap() hands $kept back
+        $ran = false;
+
         try {
-            $computed = $this->inner->get($key, $this->wrap($key, $callback, true, $kept, null !== $kept), \INF, $metadata);
+            $computed = $this->inner->get($key, $this->wrap($key, $callback, true, $kept, null !== $kept, $ran), \INF, $metadata);
         } catch (\Throwable $e) {
             // the computation failed: serve the old value if it is still kept
             // for errors, otherwise let the exception through
@@ -348,7 +350,13 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
             return $computed;
         }
 
-        self::describe($metadata, $computed, false);
+        // not computed here and not fresh: the inner pool's lock answered
+        // with what is stored, the old value, instead of computing. Symfony's
+        // LockRegistry does that after it waited for another process, before
+        // symfony/cache 6.4.31, 7.3.9, 7.4.3 and 8.0.3. It is served as what
+        // it is, a stale value; the next read computes
+        $stale = !$ran && !$computed->isFresh(microtime(true));
+        self::describe($metadata, $computed, $stale);
 
         return $computed->value;
     }
@@ -460,11 +468,16 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
      * pool's lock, so the failure is stored before the lock is released and
      * the next request that takes the lock finds it.
      *
+     * $ran is set to true when the callback returned a value. It stays false
+     * when the inner pool's callback wrapper answered without calling this
+     * (a lock that read the stored value back after waiting), and when a
+     * stored value or $kept was reused.
+     *
      * @return \Closure(ItemInterface, bool): mixed
      */
-    private function wrap(string $key, callable $callback, bool $reuseFresh, ?Record $kept = null, bool $remember = false): \Closure
+    private function wrap(string $key, callable $callback, bool $reuseFresh, ?Record $kept = null, bool $remember = false, bool &$ran = false): \Closure
     {
-        return function (ItemInterface $item, bool &$save) use ($key, $callback, $reuseFresh, $kept, $remember): mixed {
+        return function (ItemInterface $item, bool &$save) use ($key, $callback, $reuseFresh, $kept, $remember, &$ran): mixed {
             if ($reuseFresh) {
                 [$record, $failedAt] = $this->look($key, $kept);
 
@@ -495,6 +508,7 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
                 throw $e;
             }
 
+            $ran = true;
             $record = $this->record($value, $item instanceof CacheItem ? ($this->expiryOf)($item) : null);
             $this->keep($item, $record);
 
@@ -507,17 +521,19 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
      * or null when this process did not refresh. With a deferrer, hands the
      * refresh over and returns null. $kept is the value kept for errors when
      * the refresh is the next attempt after a failure (see refresh()).
+     * $remember says whether a refresh that fails is remembered: only for a
+     * value kept for errors, because nothing reads the failure of any other.
      */
-    private function schedule(string $key, callable $callback, ?Record $kept = null): ?Record
+    private function schedule(string $key, callable $callback, ?Record $kept = null, bool $remember = true): ?Record
     {
         if (null === $this->deferrer) {
-            return $this->refresh($key, $callback, $kept);
+            return $this->refresh($key, $callback, $kept, $remember);
         }
 
         // the key includes this pool's id, so two pools that share one
         // deferrer each keep their own refresh of the same cache key
-        ($this->deferrer)(function () use ($key, $callback, $kept): void {
-            $this->refresh($key, $callback, $kept);
+        ($this->deferrer)(function () use ($key, $callback, $kept, $remember): void {
+            $this->refresh($key, $callback, $kept, $remember);
         }, $key.'@'.$this->poolHash);
 
         return null;
@@ -527,15 +543,16 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
      * Refreshes one value, if this process wins the election. It looks at the
      * stored value first, because another process may have refreshed it
      * meanwhile. Only then does it compute, through the inner pool's forced
-     * get(). A refresh that fails keeps the stale value and is remembered
-     * (see failed()). The election's lock is released either way.
+     * get(). A refresh that fails keeps the stale value and, with $remember,
+     * is remembered (see failed()). The election's lock is released either
+     * way.
      *
      * With $kept, the refresh is the next attempt after a failure, for a
      * value past its stale time. The look then reads the failure too, in the
      * same round trip. If another process tried again and failed less than
      * $errorRetrySeconds ago, nothing is computed.
      */
-    private function refresh(string $key, callable $callback, ?Record $kept = null): ?Record
+    private function refresh(string $key, callable $callback, ?Record $kept = null, bool $remember = true): ?Record
     {
         try {
             $release = $this->election->tryLock($key, $this->refreshLockTtlMs);
@@ -572,7 +589,15 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
 
             // compute through the inner pool's forced get(), so that the inner
             // pool's lock still applies
-            $refreshed = $this->inner->get($key, $this->wrap($key, $callback, false, null, true), \INF);
+            $ran = false;
+            $refreshed = $this->inner->get($key, $this->wrap($key, $callback, false, null, $remember, $ran), \INF);
+
+            if (!$ran && $refreshed instanceof Record && !$refreshed->isFresh(microtime(true))) {
+                // nothing was computed: the inner pool's lock answered with
+                // the stored value, the stale one (see get()). It stays
+                // stale, and a remembered failure stays remembered
+                return null;
+            }
 
             if (null !== $kept) {
                 // the attempt succeeded, so the failure is over: forgotten,

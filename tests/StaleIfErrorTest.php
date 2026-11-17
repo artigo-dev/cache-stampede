@@ -316,6 +316,80 @@ final class StaleIfErrorTest extends TestCase
         self::assertSame(1, $this->failed);
     }
 
+    public function testAFailedRefreshOfAValueNotKeptForErrorsIsNotRemembered(): void
+    {
+        // inside its stale time, with no time kept for errors: past the stale
+        // time it is gone, so nothing would ever read the failure
+        $this->store('old', microtime(true) - 1, 60, 0, 60);
+
+        self::assertSame('old', $this->pool(0)->get('k', $this->down()));
+        self::assertSame(1, $this->failed);
+        self::assertNull($this->remembered());
+    }
+
+    public function testAFailedRefreshIsRememberedForAValueAnotherPoolKeepsForErrors(): void
+    {
+        // the value's own time kept for errors counts, not this pool's: the
+        // pool that wrote it serves it past its stale time
+        $this->store('old', microtime(true) - 1, 60, 600);
+
+        self::assertSame('old', $this->pool(0)->get('k', $this->down()));
+        self::assertNotNull($this->remembered());
+    }
+
+    public function testAValueTheInnerPoolsLockReadBackInsteadOfComputingIsServedAsStale(): void
+    {
+        $inner = $this->readingBack(new Record('old', microtime(true) - 70, 60, 600));
+
+        try {
+            $pool = new StaleCache($inner, staleSeconds: 60, staleIfErrorSeconds: 600, election: $this->election);
+            $value = $pool->get('k', $this->down(), metadata: $metadata);
+
+            self::assertSame('old', $value);
+            self::assertSame(0, $this->failed, 'nothing was computed here');
+            self::assertIsArray($metadata);
+            self::assertTrue($metadata[StaleCache::METADATA_STALE] ?? false, 'an old value is never handed out as a fresh one');
+        } finally {
+            $inner->clear();
+        }
+    }
+
+    public function testARefreshTheInnerPoolsLockReadBackLeavesTheValueStale(): void
+    {
+        $inner = $this->readingBack(new Record('old', microtime(true) - 1, 60, 600));
+
+        try {
+            $pool = new StaleCache($inner, staleSeconds: 60, staleIfErrorSeconds: 600, election: $this->election);
+            $value = $pool->get('k', $this->down(), metadata: $metadata);
+
+            self::assertSame('old', $value);
+            self::assertSame(0, $this->failed);
+            self::assertIsArray($metadata);
+            self::assertTrue($metadata[StaleCache::METADATA_STALE] ?? false);
+        } finally {
+            $inner->clear();
+        }
+    }
+
+    public function testARetryTheInnerPoolsLockReadBackDoesNotForgetTheFailure(): void
+    {
+        $inner = $this->readingBack(new Record('old', microtime(true) - 70, 60, 600));
+        $inner->save($inner->getItem(self::failedKey())->set(microtime(true) - 5)->expiresAfter(31));
+
+        try {
+            $pool = new StaleCache($inner, staleSeconds: 60, staleIfErrorSeconds: 600, election: $this->election);
+            $value = $pool->get('k', $this->down(), metadata: $metadata);
+
+            self::assertSame('old', $value);
+            self::assertSame(0, $this->failed);
+            self::assertIsArray($metadata);
+            self::assertTrue($metadata[StaleCache::METADATA_STALE] ?? false);
+            self::assertTrue($inner->getItem(self::failedKey())->isHit(), 'no attempt succeeded, so the failure stays remembered');
+        } finally {
+            $inner->clear();
+        }
+    }
+
     public function testAFailureIsRememberedForTheRetryTimeAndTheTimeARefreshMayTake(): void
     {
         $this->store('old', microtime(true) - 70, 60, 600);
@@ -407,6 +481,26 @@ final class StaleIfErrorTest extends TestCase
 
             throw new \RuntimeException('the origin is down');
         };
+    }
+
+    /**
+     * A pool that holds $record under 'k' and whose lock never computes: it
+     * answers with what is stored, as Symfony's LockRegistry does for a
+     * forced get() after it waited for another process, before symfony/cache
+     * 6.4.31, 7.3.9, 7.4.3 and 8.0.3.
+     */
+    private function readingBack(Record $record): FilesystemAdapter
+    {
+        // a pool that calls its callback wrapper, as ArrayAdapter does not
+        $inner = new FilesystemAdapter('stale-test-'.bin2hex(random_bytes(4)));
+        $inner->save($inner->getItem('k')->set($record)->expiresAfter(3_600));
+        $inner->setCallbackWrapper(static function (callable $callback, ItemInterface $item, bool &$save) use ($inner): mixed {
+            $save = false;
+
+            return $inner->getItem($item->getKey())->get();
+        });
+
+        return $inner;
     }
 
     private function store(string $value, float $freshUntil, int $stale, int $error, ?int $keepFor = null): void

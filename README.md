@@ -708,10 +708,21 @@ invalidation reached are never served, whatever is remembered.
 `stale.failed.` and a hash of the value's key, a float, for
 `errorRetrySeconds` plus the refresh lock's TTL. It is written on a failure
 only, and read only for a value past its stale time, so a hit, a miss and a
-stale read cost what they did. A refresh of a stale value that fails is
-remembered too. Inside the stale time that changes nothing — a stale read is
-served at once and may refresh, as before — but when the stale time ends
-during an outage, nobody has to compute to find out.
+stale read cost what they did. A refresh of a stale value kept for errors
+that fails is remembered too. Inside the stale time that changes nothing — a
+stale read is served at once and may refresh, as before — but when the stale
+time ends during an outage, nobody has to compute to find out. The failure's
+time comes from the clock of the server where it failed, and is compared with
+times other servers wrote: like every fresh or stale decision of this pool,
+that assumes the app servers' clocks are synchronised (NTP).
+
+**Without `MemoLock`**, the inner pool's lock is Symfony's `LockRegistry`.
+Before symfony/cache 6.4.31, 7.3.9, 7.4.3 and 8.0.3 (and in all of 7.0 to 7.2),
+a request that waited for that lock reads the stored value back instead of
+computing it, so after a failed computation it gets the old value. This pool
+serves it flagged as what it is (`METADATA_STALE`), and the next read
+computes. A request that waited behind an unrelated key in the same lock slot
+gets the old value too. Upgrade symfony/cache, or use `MemoLock`.
 
 **The log.** Each failed computation is logged once, as an error with the
 exception: the origin is down even though every request is answered. A
