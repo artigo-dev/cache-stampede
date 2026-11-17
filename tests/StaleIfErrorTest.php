@@ -15,6 +15,7 @@ use Artigo\Cache\Stale\Record;
 use Artigo\Cache\Stale\RefreshQueue;
 use Artigo\Cache\StaleCache;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\AbstractLogger;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
 use Symfony\Component\Cache\Adapter\FilesystemAdapter;
 use Symfony\Contracts\Cache\ItemInterface;
@@ -295,6 +296,55 @@ final class StaleIfErrorTest extends TestCase
         $this->expectExceptionMessage('"$errorRetrySeconds" must not be negative');
 
         new StaleCache($this->inner, staleSeconds: 60, errorRetrySeconds: -1);
+    }
+
+    public function testAFailedComputationIsLoggedOnceAsAnError(): void
+    {
+        $logger = self::logger();
+        $pool = $this->pool(600);
+        $pool->setLogger($logger);
+        $this->store('old', microtime(true) - 70, 60, 600);
+
+        // past its stale time: computed, failed, logged; then remembered, so
+        // the next read computes nothing and logs nothing
+        $pool->get('k', $this->down());
+        $pool->get('k', $this->down());
+
+        self::assertSame(1, $this->failed);
+        self::assertSame([['error', 'Computing "{key}" failed; its stale value is served: {message}']], $logger->records);
+    }
+
+    public function testAFailedRefreshIsLoggedAsAnError(): void
+    {
+        $logger = self::logger();
+        $pool = $this->pool(600);
+        $pool->setLogger($logger);
+
+        // inside its stale time: served stale, refreshed inline, which fails
+        $this->store('old', microtime(true) - 1, 60, 600);
+        $pool->get('k', $this->down());
+
+        self::assertSame([['error', 'Refreshing "{key}" failed; its stale value stays: {message}']], $logger->records);
+    }
+
+    /**
+     * @return AbstractLogger&object{records: list<array{string, string}>}
+     */
+    private static function logger(): AbstractLogger
+    {
+        return new class extends AbstractLogger {
+            /** @var list<array{string, string}> */
+            public array $records = [];
+
+            /**
+             * @param string|\Stringable   $message
+             * @param array<string, mixed> $context
+             */
+            public function log($level, $message, array $context = []): void
+            {
+                $this->records[] = [\is_string($level) ? $level : '', (string) $message];
+            }
+        };
     }
 
     private function pool(int $staleIfError): StaleCache

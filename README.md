@@ -711,9 +711,12 @@ remembered too. Inside the stale time that changes nothing — a stale read is
 served at once and may refresh, as before — but when the stale time ends
 during an outage, nobody has to compute to find out.
 
-**The log.** Each failed computation is logged once, as a warning with the
-exception. Symfony's default logger, without Monolog, drops warnings in
-`prod`: give the pool a logger that keeps them, or the outage is silent.
+**The log.** Each failed computation is logged once, as an error with the
+exception: the origin is down even though every request is answered. A
+warning would go unseen with Symfony's defaults, whose logger without
+Monolog writes from `error` up, and whose Monolog recipe writes a
+request's log only when it holds an error. Since a failure is remembered,
+an outage logs one error per key per retry time, not one per request.
 
 So a value is kept for `staleIfErrorSeconds` after its stale time, to be
 served only when computing it again fails, and a failing origin costs one

@@ -330,7 +330,7 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
                 throw $e;
             }
 
-            $this->logger?->warning('Computing "{key}" failed; its stale value is served: {message}', ['key' => $key, 'message' => $e->getMessage(), 'exception' => $e]);
+            $this->logger?->error('Computing "{key}" failed; its stale value is served: {message}', ['key' => $key, 'message' => $e->getMessage(), 'exception' => $e]);
             self::describe($metadata, $kept, true);
 
             return $kept->value;
@@ -576,7 +576,7 @@ final class StaleCache implements AdapterInterface, TagAwareCacheInterface, Prun
 
             return $refreshed instanceof Record ? $refreshed : null;
         } catch (\Throwable $e) {
-            $this->logger?->warning('Refreshing "{key}" failed; its stale value stays: {message}', ['key' => $key, 'message' => $e->getMessage(), 'exception' => $e]);
+            $this->logger?->error('Refreshing "{key}" failed; its stale value stays: {message}', ['key' => $key, 'message' => $e->getMessage(), 'exception' => $e]);
 
             return null;
         } finally {
