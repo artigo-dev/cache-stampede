@@ -495,8 +495,7 @@ final class MemoLock implements Election
                     $value = $callback($item, $save);
 
                     // save the value here, before the lock is released below,
-                    // so that the waiters find it when they wake up. $save is
-                    // then false, so Symfony does not save it a second time
+                    // so that the waiters find it when they wake up
                     if ($save) {
                         // let Symfony note the expiry and the time the
                         // computation took on the item, before it is saved
@@ -505,11 +504,16 @@ final class MemoLock implements Election
                         }
 
                         $saved = $pool->save($item->set($value));
-                        $save = false;
+
+                        // with $save false, Symfony does not save it a second
+                        // time. A failed save that $setMetadata cannot pass on
+                        // leaves it true: Symfony then saves once more, after
+                        // the lock is released, and reports it if that save
+                        // fails too
+                        $save = !$saved && !self::takesTheAnswer($setMetadata);
 
                         // pass on whether the save worked. Symfony 8.2 reports
-                        // a failed save to the caller in $metadata. Earlier
-                        // versions take one argument and ignore the second
+                        // a failed save to the caller in $metadata
                         if (null !== $setMetadata) {
                             $setMetadata($item, $saved);
                         }
@@ -599,6 +603,23 @@ final class MemoLock implements Election
     private function keepAlive(string $key, string $lockKey, string $token): KeepAlive
     {
         return new KeepAlive($this->redis, $key, $lockKey, $token, $this->lockTtlMs);
+    }
+
+    /**
+     * Whether $setMetadata takes what save() answered as its second argument.
+     * Symfony 8.2's closure does. The closure of 6.4 to 8.1 takes the item
+     * alone, and PHP drops the second argument. Without a closure nothing
+     * hears the answer at all.
+     */
+    private static function takesTheAnswer(?\Closure $setMetadata): bool
+    {
+        if (null === $setMetadata) {
+            return false;
+        }
+
+        $function = new \ReflectionFunction($setMetadata);
+
+        return $function->isVariadic() || 2 <= $function->getNumberOfParameters();
     }
 
     /**

@@ -33,6 +33,9 @@
         "symfony/event-dispatcher": "^6.4|^7.0|^8.0",
         "symfony/lock": "^6.4|^7.0|^8.0"
     },
+    "conflict": {
+        "artigo/versioned-cache": "<2.3"
+    },
     "suggest": {
         "ext-redis": "For MemoLock, which is woken by a message instead of a poll",
         "ext-relay": "Relay works anywhere ext-redis does",

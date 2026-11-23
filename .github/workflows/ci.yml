@@ -31,9 +31,12 @@ jobs:
                     - php: '8.4'
                       symfony: '8.1.*'
                       redis: '8'
+                    # with versioned-cache: before 8.2 a failed save is made
+                    # once more, and its guard has to refuse that one too
                     - php: '8.5'
                       symfony: '8.1.*'
                       redis: '8'
+                      versioned: true
                     # Symfony's development branch: it reports a failed save
                     # through $metadata, and is where what calls the wrapper
                     # changes next
@@ -87,9 +90,11 @@ jobs:
               run: |
                   composer config minimum-stability dev
                   composer config prefer-stable true
-                  # the soft tests need versioned-cache 2.0's soft invalidation, on
-                  # Redis 8 like this leg
-                  composer require --dev --no-update artigo/versioned-cache:^2.0
+
+            # the soft tests and the guard's need versioned-cache, on Redis 8
+            # like these legs
+            - if: matrix.dev || matrix.versioned
+              run: composer require --dev --no-update artigo/versioned-cache:^2.3
 
             # resolve against the Symfony line of this leg rather than the
             # lock file, which pins the newest

@@ -21,24 +21,35 @@
   lock store degrades to computing without protection, and says so through the
   PSR-3 logger. A lock that cannot be handed back once the value is computed is
   logged and left to expire; the value is still served.
-- **On Symfony 8.2, a save that fails reaches the caller.** The lock that
-  computes an item saves it itself, and passes what `save()` answered back
-  through the `$setMetadata` closure Symfony hands every wrapper, so a refused
-  or failed write shows up in `get()`'s `$metadata` as
-  `ItemInterface::METADATA_SAVE_FAILED`, as it does without a wrapper. The
-  value is returned either way. **Before 8.2 a failed save is reported only by a pool with no
-  wrapper at all.** With symfony/cache-contracts 3.8, which adds the key, the
-  contracts' `CacheTrait` reports a failed save when it saves the item itself:
-  under the CLI, where Symfony sets no wrapper, or after
-  `setCallbackWrapper(null)`. A wrapper that saves inside its lock clears
-  `$save`, so `CacheTrait` saves nothing and reports nothing. That is
-  Symfony's own `LockRegistry` on 6.4 to 8.1, which does not look at what
-  `save()` answered, and it is both locks here: the `$setMetadata` closure of
-  those versions takes the item alone, so the answer they pass is dropped. On
-  6.4 to 8.1 the locks here report what `LockRegistry` reports, which is
-  nothing; the one difference is the CLI, where Symfony's default is off and a
-  failed save is reported, and these locks stay on. With older contracts there
-  is no such key.
+- **A save that fails reaches the caller.** The lock that computes an item
+  saves it itself, before it releases the lock, and clears `$save` so that
+  Symfony does not save it again. It passes what `save()` answered back
+  through the `$setMetadata` closure Symfony hands every wrapper. On Symfony
+  8.2 that closure takes the answer, so a refused or failed write shows up in
+  `get()`'s `$metadata` as `ItemInterface::METADATA_SAVE_FAILED`, as it does
+  without a wrapper. On 6.4 to 8.1 the closure takes the item alone and would
+  lose the answer, so after a failed save the lock leaves `$save` set instead:
+  Symfony saves the item once more, and when that save fails too,
+  symfony/cache-contracts 3.8.1 and later report it under the same key. Older
+  contracts have no such key and report nothing. A wrapper called without a
+  `$setMetadata` closure, which Symfony never does, leaves `$save` set the
+  same way. The value is returned either way.
+- **That second save has a price.** A pool that refuses every write is asked
+  twice for each value computed: with the store down that is its timeout
+  twice, and Symfony's warning twice. A `ChainAdapter` answers false when one
+  of its pools failed, so the others are written twice. With contracts older
+  than 3.8.1 the second save is still made and nothing is reported; what is
+  left is the second try. And the second save comes after the lock is
+  released: if it works, the value lands a moment after the waiters were
+  woken, so a waiter that already looked finds nothing, takes the lock and
+  computes the value once more. A pool that guards its writes compares both
+  saves with the same read: versioned-cache refuses a write computed across a
+  delete the second time too, and nothing stale is stored. That holds from
+  versioned-cache 2.3, which is why this package conflicts with older ones:
+  they forgot a read older than the guard window after refusing once, and
+  the second save went through. Symfony's own
+  `LockRegistry` on 6.4 to 8.1 saves once, does not look at what `save()`
+  answered, and reports nothing.
 - **Neither lock waits into `max_execution_time`.** A second before the limit
   the waiter stops and computes unprotected, as `LockRegistry` does, rather
   than be killed with nothing computed and nothing served; `exclusively()`

@@ -18,8 +18,10 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Cache\CacheItemInterface;
 use Psr\Log\AbstractLogger;
+use Symfony\Component\Cache\Adapter\AbstractTagAwareAdapter;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
 use Symfony\Component\Cache\Adapter\TagAwareAdapter;
+use Symfony\Component\Cache\Marshaller\DefaultMarshaller;
 use Symfony\Component\Lock\Exception\LockConflictedException;
 use Symfony\Component\Lock\Key;
 use Symfony\Component\Lock\LockFactory;
@@ -34,6 +36,10 @@ use Symfony\Contracts\Cache\ItemInterface;
  * hooks the save from inside the $setMetadata closure, keyed on the item,
  * relies on every part of it.
  *
+ * A failed save that $setMetadata cannot pass on, because it takes the item
+ * alone (Symfony 6.4 to 8.1) or there is none, leaves $save true instead:
+ * the pool saves once more and reports that save itself.
+ *
  * And the lock is handed back without ever costing the caller the value: a
  * release that throws is logged, and the lock left to expire.
  *
@@ -41,12 +47,23 @@ use Symfony\Contracts\Cache\ItemInterface;
  */
 final class WrapperContractTest extends TestCase
 {
+    /**
+     * By name: nothing here depends on versioned-cache being installed.
+     */
+    private const VERSIONED = 'Artigo\\Cache\\Adapter\\VersionedRedisTagAwareAdapter';
+
     private \Redis|\Relay\Relay|null $redis = null;
+
+    private ?string $namespace = null;
 
     protected function tearDown(): void
     {
         if (null !== $this->redis) {
             Connection::sweep($this->redis, 'memolock:*');
+
+            if (null !== $this->namespace) {
+                Connection::sweep($this->redis, $this->namespace.'*');
+            }
         }
     }
 
@@ -87,26 +104,153 @@ final class WrapperContractTest extends TestCase
         self::assertFalse($save, 'the wrapper saved the item, so the pool must not save it again');
     }
 
+    /**
+     * @return iterable<string, array{string, string, int, bool}>
+     */
+    public static function closuresAndSaves(): iterable
+    {
+        foreach (['MemoLock' => 'memo', 'FleetLock' => 'fleet'] as $name => $wrapper) {
+            yield $name.', a closure that takes the item alone, saved' => [$wrapper, 'item', 0, false];
+            yield $name.', a closure that takes the item alone, refused' => [$wrapper, 'item', \PHP_INT_MAX, true];
+            yield $name.', no closure, saved' => [$wrapper, 'none', 0, false];
+            yield $name.', no closure, refused' => [$wrapper, 'none', \PHP_INT_MAX, true];
+            yield $name.', a closure that takes any number of arguments, refused' => [$wrapper, 'variadic', \PHP_INT_MAX, false];
+        }
+    }
+
+    #[DataProvider('closuresAndSaves')]
+    public function testARefusedSaveIsLeftToThePoolWhenSetMetadataCannotPassItOn(string $wrapper, string $closure, int $refusals, bool $saveAgain): void
+    {
+        $events = [];
+        $save = true;
+        $pool = self::pool($events, $refusals);
+
+        $value = $this->wrapper($wrapper)->__invoke(
+            static fn (): string => 'computed',
+            $pool->getItem('left'),
+            $save,
+            $pool,
+            match ($closure) {
+                'item' => static function (ItemInterface $item): void {},
+                'variadic' => static function (mixed ...$arguments): void {},
+                default => null,
+            },
+        );
+
+        self::assertSame('computed', $value);
+        self::assertCount(1, $events, 'the wrapper saved once');
+        self::assertSame($saveAgain, $save, $saveAgain ? 'nothing can pass the refusal on, so the pool saves once more' : 'saved, or the refusal was passed on: the pool must not save it again');
+    }
+
     #[DataProvider('wrappers')]
     public function testARefusedSaveReachesTheCallerAsSaveFailed(string $wrapper): void
     {
-        // the constant alone says nothing: it comes with symfony/cache-contracts,
-        // which a symfony/cache that never sets it installs as well
-        $version = InstalledVersions::getVersion('symfony/cache');
-
-        if (null === $version || version_compare($version, '8.2.0.0-dev', '<')) {
-            self::markTestSkipped('Symfony reports a failed save in $metadata from 8.2 on.');
-        }
-
         $events = [];
-        $pool = new TagAwareAdapter(self::pool($events, refuse: true));
+        $pool = new TagAwareAdapter(self::pool($events, refusals: \PHP_INT_MAX));
         $pool->setCallbackWrapper($this->wrapper($wrapper));
 
         $value = $pool->get('refused', static fn (): string => 'computed', metadata: $metadata);
 
         self::assertSame('computed', $value, 'a refused save still serves the value');
-        self::assertIsArray($metadata);
-        self::assertTrue($metadata[ItemInterface::METADATA_SAVE_FAILED] ?? false, 'the refusal reached the caller');
+        self::assertCount(
+            self::setMetadataTakesTheAnswer() ? 1 : 2,
+            $events,
+            'from 8.2 the wrapper passes the refusal on and its save is the only one; before, the pool saves once more',
+        );
+
+        // symfony/cache-contracts has the key from 3.8.1 on; before, nothing
+        // can report the refusal
+        if (\defined(ItemInterface::class.'::METADATA_SAVE_FAILED')) {
+            self::assertIsArray($metadata);
+            self::assertTrue($metadata[ItemInterface::METADATA_SAVE_FAILED] ?? false, 'the refusal reached the caller');
+        }
+    }
+
+    #[DataProvider('wrappers')]
+    public function testASaveRefusedOnceLandsWhenThePoolSavesOnceMore(string $wrapper): void
+    {
+        if (self::setMetadataTakesTheAnswer()) {
+            self::markTestSkipped('From Symfony 8.2 the wrapper passes the refusal on, and the pool does not save again.');
+        }
+
+        $events = [];
+        $pool = new TagAwareAdapter(self::pool($events, refusals: 1));
+        $pool->setCallbackWrapper($this->wrapper($wrapper));
+
+        $value = $pool->get('second', static fn (): string => 'computed', metadata: $metadata);
+
+        self::assertSame('computed', $value);
+        self::assertCount(2, $events, 'refused once, then saved by the pool');
+        self::assertSame('computed', $pool->getItem('second')->get(), 'stored');
+
+        if (\defined(ItemInterface::class.'::METADATA_SAVE_FAILED')) {
+            self::assertIsArray($metadata);
+            self::assertArrayNotHasKey(ItemInterface::METADATA_SAVE_FAILED, $metadata, 'the save that counts worked');
+        }
+    }
+
+    #[DataProvider('wrappers')]
+    public function testASaveThatWorksIsMadeOnce(string $wrapper): void
+    {
+        $events = [];
+        $pool = new TagAwareAdapter(self::pool($events));
+        $pool->setCallbackWrapper($this->wrapper($wrapper));
+
+        $value = $pool->get('once', static fn (): string => 'computed');
+
+        self::assertSame('computed', $value);
+        self::assertCount(1, $events, 'saved by the wrapper, and not again by the pool');
+        self::assertSame('computed', $pool->getItem('once')->get(), 'stored');
+    }
+
+    #[DataProvider('wrappers')]
+    public function testAWriteTheGuardRefusedIsRefusedWhenThePoolSavesOnceMore(string $wrapper): void
+    {
+        if (!class_exists(self::VERSIONED)) {
+            self::markTestSkipped('artigo/versioned-cache is not installed.');
+        }
+
+        $lock = $this->wrapper($wrapper);
+        $this->redis ??= Connection::openSingleNode();
+        $this->namespace = 'wrapper-guard'.bin2hex(random_bytes(3));
+
+        // counts the writes that reach the pool's store
+        $writes = new class extends DefaultMarshaller {
+            public int $count = 0;
+
+            /**
+             * @param array<mixed>      $values
+             * @param array<mixed>|null $failed
+             *
+             * @return array<mixed>
+             */
+            public function marshall(array $values, ?array &$failed): array
+            {
+                ++$this->count;
+
+                return parent::marshall($values, $failed);
+            }
+        };
+        $pool = $this->versioned($this->redis, $writes);
+        $pool->setCallbackWrapper($lock);
+        $elsewhere = $this->versioned(Connection::openSingleNode());
+
+        $value = $pool->get('raced', static function (ItemInterface $item) use ($elsewhere): string {
+            $item->expiresAfter(60);
+            // another process deletes the key while this one computes it
+            $elsewhere->deleteItem('raced');
+
+            return 'computed across a delete';
+        }, metadata: $metadata);
+
+        self::assertSame('computed across a delete', $value, 'the caller still gets its value');
+        self::assertSame(self::setMetadataTakesTheAnswer() ? 1 : 2, $writes->count, 'from 8.2 one write, before it one more from the pool');
+        self::assertFalse($this->versioned(Connection::openSingleNode())->getItem('raced')->isHit(), 'refused every time: the delete stands');
+
+        if (\defined(ItemInterface::class.'::METADATA_SAVE_FAILED')) {
+            self::assertIsArray($metadata);
+            self::assertTrue($metadata[ItemInterface::METADATA_SAVE_FAILED] ?? false, 'the refusal reached the caller');
+        }
     }
 
     #[DataProvider('wrappers')]
@@ -201,7 +345,7 @@ final class WrapperContractTest extends TestCase
      */
     private function call(string $wrapper, string $key, array &$events, bool &$save, bool $refuse = false): array
     {
-        $pool = self::pool($events, $refuse);
+        $pool = self::pool($events, $refuse ? \PHP_INT_MAX : 0);
         $item = $pool->getItem($key);
 
         $setMetadata = static function (ItemInterface $item, ?bool $saved = null) use (&$events): void {
@@ -232,12 +376,23 @@ final class WrapperContractTest extends TestCase
     }
 
     /**
+     * Whether symfony/cache hands the wrapper a $setMetadata closure that
+     * takes what save() answered, which it does from 8.2 on.
+     */
+    private static function setMetadataTakesTheAnswer(): bool
+    {
+        $version = InstalledVersions::getVersion('symfony/cache');
+
+        return null !== $version && version_compare($version, '8.2.0.0-dev', '>=');
+    }
+
+    /**
      * An in-memory pool that records every item it is asked to save, and
-     * refuses them all if told to.
+     * refuses the first $refusals of them.
      *
      * @param list<Event> $events
      */
-    private static function pool(array &$events, bool $refuse = false): ArrayAdapter
+    private static function pool(array &$events, int $refusals = 0): ArrayAdapter
     {
         $pool = new class extends ArrayAdapter {
             /** @var \Closure(CacheItemInterface): bool */
@@ -249,11 +404,31 @@ final class WrapperContractTest extends TestCase
             }
         };
 
-        $pool->onSave = static function (CacheItemInterface $item) use (&$events, $refuse): bool {
+        $pool->onSave = static function (CacheItemInterface $item) use (&$events, &$refusals): bool {
             $events[] = ['save', $item];
 
-            return !$refuse;
+            if (0 < $refusals) {
+                --$refusals;
+
+                return false;
+            }
+
+            return true;
         };
+
+        return $pool;
+    }
+
+    /**
+     * A versioned-cache pool in this test's namespace, whose invalidation
+     * guard refuses a write computed across a delete.
+     */
+    private function versioned(\Redis|\Relay\Relay $redis, ?DefaultMarshaller $marshaller = null): AbstractTagAwareAdapter
+    {
+        $versioned = self::VERSIONED;
+
+        /** @var AbstractTagAwareAdapter $pool */
+        $pool = new $versioned($redis, (string) $this->namespace, marshaller: $marshaller, rulesCache: false); // @phpstan-ignore class.notFound (installed or not, see the test)
 
         return $pool;
     }

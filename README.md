@@ -517,8 +517,8 @@ Four things to know before production:
   the waiter stops and computes unprotected rather than be killed with nothing
   served; `exclusively()` throws `LockUnavailable` instead.
 
-The rest, among them failed saves on Symfony 8.2 and why waiters take a read
-lock: [docs/notes.md](docs/notes.md)
+The rest, among them how a failed save reaches the caller and why waiters take
+a read lock: [docs/notes.md](docs/notes.md)
 
 ## Use them together
 
