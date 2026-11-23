@@ -18,6 +18,8 @@ declare(strict_types=1);
  * Not meant to be run by hand.
  */
 
+use Artigo\Cache\Benchmarks\ExclusiveBlockingStore;
+use Artigo\Cache\Benchmarks\ExclusiveStore;
 use Artigo\Cache\FleetLock;
 use Artigo\Cache\MemoLock;
 use Artigo\Cache\Stale\RefreshQueue;
@@ -30,6 +32,7 @@ use Symfony\Component\Lock\Store\RedisStore;
 use Symfony\Contracts\Cache\ItemInterface;
 
 require dirname(__DIR__, 2).'/vendor/autoload.php';
+require __DIR__.'/exclusive-stores.php';
 
 $options = json_decode((string) ($argv[1] ?? '{}'), true, 16, \JSON_THROW_ON_ERROR);
 
@@ -89,6 +92,18 @@ switch ($mode) {
         // what symfony/lock would need for its waiters to be woken by a
         // message rather than a poll - the RFC's option 3, measured
         $pool->setCallbackWrapper(new FleetLock(new LockFactory(PubSubRedisStore::fromDsn($dsn))));
+        break;
+
+    case 'fleetlock-exclusive':
+        // fleetlock with its waiters on the exclusive lock: the store hides
+        // its shared-lock support, so the Lock component falls back to it
+        $pool->setCallbackWrapper(new FleetLock(new LockFactory(new ExclusiveStore(new RedisStore($redis)))));
+        break;
+
+    case 'fleetlock-pubsub-exclusive':
+        // fleetlock-pubsub with its waiters on the exclusive lock, still woken
+        // by a message
+        $pool->setCallbackWrapper(new FleetLock(new LockFactory(new ExclusiveBlockingStore(PubSubRedisStore::fromDsn($dsn)))));
         break;
 
     case 'symfony-onehost':

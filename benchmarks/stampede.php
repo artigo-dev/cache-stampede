@@ -30,7 +30,9 @@ declare(strict_types=1);
  * Options: dsn=, workers=, resolverMs=, hosts=, lead=, modes=, keys=
  * Modes: nolock, memolock, fleetlock (symfony/lock's RedisStore), fleetlock-pubsub
  * (the same on a RedisStore whose waiters are woken by a message),
- * symfony-onehost, symfony-multihost
+ * fleetlock-exclusive and fleetlock-pubsub-exclusive (those two with their
+ * waiters on the exclusive lock rather than the read lock), symfony-onehost,
+ * symfony-multihost
  *
  * modes=swr asks another question: what does a visitor wait when a hot key
  * turns stale? Its three rows share one warm key, written beforehand:
@@ -46,7 +48,7 @@ declare(strict_types=1);
  *
  * keys=collide gives every worker a *different* cold key, chosen so they all
  * land on the same LockRegistry slot. LockRegistry spreads the whole keyspace
- * over a couple of dozen lock files - 24 on Symfony 8.1, 25 on 6.4 and 7.3 -
+ * over a couple of dozen lock files - 25 on Symfony 6.4 and 7.4, 24 on 8.1 -
  * so unrelated items share a lock and wait for one another. This models it
  * with a set of its own, LOCK_FILES wide; the count changes which keys happen
  * to collide and nothing else.

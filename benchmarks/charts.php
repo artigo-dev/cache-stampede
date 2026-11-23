@@ -38,16 +38,19 @@ const STAMPEDE = [
  * php benchmarks/stampede.php workers=N resolverMs=300 keys=collide modes=symfony-onehost,memolock,fleetlock
  * Distinct cold keys that share one of LockRegistry's lock files. Milliseconds
  * for the slowest of them, where each takes 300 ms to compute, the middle of
- * three runs. MemoLock and FleetLock (on RedisStore) lock each key on its own
- * and measured within a millisecond of each other (302-303 ms), so they share
- * one line, drawn at the slower. LockRegistry's handovers wait for its 100 ms
- * poll, so its times move between runs (six keys: 1.81, 1.90 and 2.30 s).
+ * three runs (seven for two keys). MemoLock and FleetLock (on RedisStore) lock
+ * each key on its own and measured within a millisecond of each other
+ * (302-303 ms), so they share one line, drawn at the slower. LockRegistry's
+ * handovers wait for its 100 ms poll, so its times move between runs (eight
+ * keys: 2.606, 3.105 and 3.105 s). Measured on 2026-11-06, except
+ * LockRegistry's six keys: 2.304 s in all three runs of 2026-11-22, which
+ * replaced 1.904 s; the rest matched within a millisecond and kept its value.
  */
 const FALSE_SHARING = [
     'labels' => ['2 keys', '4 keys', '6 keys', '8 keys'],
     'series' => [
         ['name' => 'MemoLock / FleetLock', 'colour' => '#3ddc97', 'values' => [302, 303, 303, 303]],
-        ['name' => 'LockRegistry', 'colour' => '#ff6b6b', 'values' => [702, 1503, 1904, 3105]],
+        ['name' => 'LockRegistry', 'colour' => '#ff6b6b', 'values' => [702, 1503, 2304, 3105]],
     ],
 ];
 

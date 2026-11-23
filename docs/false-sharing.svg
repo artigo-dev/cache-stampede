@@ -20,13 +20,13 @@
 <circle cx="480.0" cy="291.2" r="4.5" fill="#3ddc97"/>
 <text x="480.0" y="310.2" font-size="11.5" font-weight="600" fill="#3ddc97" text-anchor="middle">303</text>
 <text x="494.0" y="295.2" font-size="13" font-weight="600" fill="#3ddc97">MemoLock / FleetLock</text>
-<polyline points="108.0,258.6 232.0,193.0 356.0,160.2 480.0,62.0" fill="none" stroke="#ff6b6b" stroke-width="2.5" stroke-linejoin="round"/>
+<polyline points="108.0,258.6 232.0,193.0 356.0,127.5 480.0,62.0" fill="none" stroke="#ff6b6b" stroke-width="2.5" stroke-linejoin="round"/>
 <circle cx="108.0" cy="258.6" r="4.5" fill="#ff6b6b"/>
 <text x="108.0" y="246.6" font-size="11.5" font-weight="600" fill="#ff6b6b" text-anchor="middle">702</text>
 <circle cx="232.0" cy="193.0" r="4.5" fill="#ff6b6b"/>
 <text x="232.0" y="181.0" font-size="11.5" font-weight="600" fill="#ff6b6b" text-anchor="middle">1,503</text>
-<circle cx="356.0" cy="160.2" r="4.5" fill="#ff6b6b"/>
-<text x="356.0" y="148.2" font-size="11.5" font-weight="600" fill="#ff6b6b" text-anchor="middle">1,904</text>
+<circle cx="356.0" cy="127.5" r="4.5" fill="#ff6b6b"/>
+<text x="356.0" y="115.5" font-size="11.5" font-weight="600" fill="#ff6b6b" text-anchor="middle">2,304</text>
 <circle cx="480.0" cy="62.0" r="4.5" fill="#ff6b6b"/>
 <text x="480.0" y="50.0" font-size="11.5" font-weight="600" fill="#ff6b6b" text-anchor="middle">3,105</text>
 <text x="494.0" y="66.0" font-size="13" font-weight="600" fill="#ff6b6b">LockRegistry</text>
