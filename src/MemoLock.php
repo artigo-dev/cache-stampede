@@ -80,6 +80,11 @@ use Symfony\Contracts\Cache\ItemInterface;
  * before the waiter subscribed, the waiter misses it, but loses at most one
  * slice, not the whole $waitTimeoutMs. The subscriber connection is opened
  * once per instance and kept.
+ *
+ * A phpredis connection whose command failed in a way that can leave a late
+ * answer on it is closed, so that the answer is never read as the answer to
+ * the next command (see RedisCommand::call()). Before phpredis 6.4 a read
+ * timeout can leave one behind.
  */
 final class MemoLock implements Election
 {
@@ -105,7 +110,8 @@ final class MemoLock implements Election
      * How many times once() and exclusively() wait and try again before they
      * give up. That is enough to outlast a holder that died while holding the
      * lock, and few enough that a lock nobody releases does not keep the
-     * caller looping forever.
+     * caller looping forever. The cache wrapper counts only the rounds in
+     * which Redis could not say whether the lock was there (see __invoke()).
      */
     private const ATTEMPTS = 10;
 
@@ -118,10 +124,32 @@ final class MemoLock implements Election
     private const WAKE_SLICE_MS = 100;
 
     /**
+     * Until when this process sends no give-back, as a Unix time (see
+     * giveBack()).
+     */
+    private static float $giveBacksPausedUntil = 0.0;
+
+    /**
      * The second connection, used only to SUBSCRIBE while waiting. It is
      * opened on the first wait and kept for the next ones.
      */
-    private \Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster|null $subscriber = null;
+    private \Redis|\Relay\Relay|\Relay\Cluster|null $subscriber = null;
+
+    /**
+     * Whether the factory returned a phpredis RedisCluster, which cannot
+     * listen for a slice (see wait()): then the waiters poll, and the factory
+     * is not called again.
+     */
+    private bool $polls = false;
+
+    /**
+     * For each lock key, the token of a SET NX whose answer could not be read
+     * and which may have set the lock after all. The wrapper and once() give it back once
+     * their computation is done (see setIfAbsent()).
+     *
+     * @var array<string, string>
+     */
+    private array $mayHold = [];
 
     /**
      * @param \Closure():(\Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster)|null $subscriberFactory opens a
@@ -229,7 +257,7 @@ final class MemoLock implements Election
 
         for ($attempt = 0; $attempt < self::ATTEMPTS; ++$attempt) {
             try {
-                $acquired = $this->acquire($lockKey, $token);
+                $acquired = $this->acquire($lockKey, $token, $logger, giveBackNow: true);
             } catch (\Throwable $e) {
                 throw new LockUnavailable(\sprintf('Could not reach the lock for "%s": %s', $key, $e->getMessage()), 0, $e);
             }
@@ -315,13 +343,20 @@ final class MemoLock implements Election
 
         for ($attempt = 0; $attempt < self::ATTEMPTS; ++$attempt) {
             try {
-                $acquired = $this->acquire($lockKey, $token);
+                $acquired = $this->acquire($lockKey, $token, $logger, giveBackNow: false);
             } catch (\Throwable $e) {
                 // Redis cannot be reached. A lock that cannot be taken must
                 // not stop the work, so make the thing without it
                 $logger?->warning('MemoLock unreachable, producing "{key}" unprotected: {message}', ['key' => $key, 'message' => $e->getMessage()]);
+                $owed = $this->owed($lockKey);
 
-                return $make(KeepAlive::unheld($key));
+                try {
+                    return $make(KeepAlive::unheld($key));
+                } finally {
+                    if (null !== $owed) {
+                        $this->giveBack($lockKey, $owed, $logger);
+                    }
+                }
             }
 
             if ($acquired) {
@@ -477,15 +512,25 @@ final class MemoLock implements Election
         $token = bin2hex(random_bytes(16));
         $until = Deadline::beforeMaxExecutionTime();
 
+        // rounds in which Redis could not say whether the lock was there
+        $blind = 0;
+
         while (true) {
             try {
-                $acquired = $this->acquire($lockKey, $token);
+                $acquired = $this->acquire($lockKey, $token, $logger, giveBackNow: false);
             } catch (\Throwable $e) {
                 // Redis cannot be reached: compute without the lock, because a
                 // cache must never be the reason a request fails
                 $logger?->warning('MemoLock unreachable, computing item "{key}" unprotected: {message}', ['key' => $key, 'message' => $e->getMessage()]);
+                $owed = $this->owed($lockKey);
 
-                return $callback($item, $save);
+                try {
+                    return $callback($item, $save);
+                } finally {
+                    if (null !== $owed) {
+                        $this->giveBack($lockKey, $owed, $logger);
+                    }
+                }
             }
 
             if ($acquired) {
@@ -529,13 +574,24 @@ final class MemoLock implements Election
             }
 
             $logger?->info('Item "{key}" is locked, waiting for the holder', ['key' => $key]);
-            $this->wait($lockKey, $channel, $logger, $until);
+            $told = $this->wait($lockKey, $channel, $logger, $until);
 
             if (null !== $until && microtime(true) >= $until) {
                 // max_execution_time is a second away: compute now without the
                 // lock, rather than be killed by PHP while still waiting.
                 // LockRegistry does the same
                 $logger?->warning('max_execution_time is near, computing item "{key}" unprotected', ['key' => $key]);
+
+                return $callback($item, $save);
+            }
+
+            // SET NX was refused, and then Redis could not say whether the
+            // lock is there: nothing was waited for. A connection that answers
+            // out of turn does that every round, so such rounds are counted. A
+            // holder at work, or one that just finished, is waited for and
+            // never counted
+            if (!$told && ++$blind >= self::ATTEMPTS) {
+                $logger?->warning('Redis could not say {attempts} times whether item "{key}" is locked, computing it anyway', ['key' => $key, 'attempts' => self::ATTEMPTS]);
 
                 return $callback($item, $save);
             }
@@ -581,7 +637,7 @@ final class MemoLock implements Election
         $lockKey = self::REFRESH_PREFIX.self::tagFor($key);
         $token = bin2hex(random_bytes(16));
 
-        if (!$this->redis->set($lockKey, $token, ['NX', 'PX' => $ttlMs])) {
+        if (!$this->setIfAbsent($lockKey, $token, $ttlMs, null, giveBackNow: true)) {
             return null;
         }
 
@@ -590,9 +646,86 @@ final class MemoLock implements Election
         };
     }
 
-    private function acquire(string $lockKey, string $token): bool
+    private function acquire(string $lockKey, string $token, ?LoggerInterface $logger, bool $giveBackNow): bool
     {
-        return (bool) $this->redis->set($lockKey, $token, ['NX', 'PX' => $this->lockTtlMs]);
+        return $this->setIfAbsent($lockKey, $token, $this->lockTtlMs, $logger, $giveBackNow);
+    }
+
+    /**
+     * SET NX PX: true when it set the key, so the lock is ours.
+     *
+     * A SET whose answer could not be read (see RedisCommand::readFailed())
+     * may still be run by Redis, and then holds the lock for $ttlMs with
+     * nobody to release it, since the caller goes on without it. Such a lock
+     * is given back (see giveBack()): at once with $giveBackNow, where
+     * nothing follows, and otherwise once the caller's computation is done,
+     * even when it throws, which gives a server that stalled time to answer
+     * again (see mayHold).
+     */
+    private function setIfAbsent(string $lockKey, string $token, int $ttlMs, ?LoggerInterface $logger, bool $giveBackNow): bool
+    {
+        try {
+            return (bool) RedisCommand::call($this->redis, fn (): mixed => $this->redis->set($lockKey, $token, ['NX', 'PX' => $ttlMs]), $logger);
+        } catch (\RedisException|\RedisClusterException $e) {
+            // only after a failed read: a SET whose connection could not be
+            // opened, or that Redis refused with an error, took nothing
+            if (RedisCommand::readFailed($e)) {
+                if ($giveBackNow) {
+                    $this->giveBack($lockKey, $token, $logger);
+                } else {
+                    $this->mayHold[$lockKey] = $token;
+                }
+            }
+
+            throw $e;
+        }
+    }
+
+    /**
+     * The token a failed SET NX on $lockKey left to give back, removed from
+     * mayHold; null when there is none.
+     */
+    private function owed(string $lockKey): ?string
+    {
+        $token = $this->mayHold[$lockKey] ?? null;
+        unset($this->mayHold[$lockKey]);
+
+        return $token;
+    }
+
+    /**
+     * Deletes a lock whose SET NX failed while reading its answer, in case
+     * Redis ran the SET after all. The delete acts only while the lock holds our token, so another
+     * holder's lock is never touched.
+     *
+     * It is one try, which waits at most WAKE_SLICE_MS for each answer (see
+     * RedisCommand::briefly()); a connection that has to be opened first may
+     * take up to the client's connect timeout, and that is not shortened. On
+     * a cluster, whose node connections keep their own read timeout, it is
+     * sent only when that is no longer than WAKE_SLICE_MS.
+     *
+     * When it fails, Redis is most likely down: this process then sends no
+     * give-back for 5 seconds, or ten times as long as the failed one took
+     * (see RedisCommand::pauseAfter()), so an outage costs one such attempt
+     * every few seconds at most. The pause is the process's, not the
+     * server's: one server that is down pauses the give-backs to every
+     * other. A delete that timed out may still be run once Redis answers
+     * again, or be dropped; a lock left behind expires on its own.
+     */
+    private function giveBack(string $lockKey, string $token, ?LoggerInterface $logger): void
+    {
+        if (microtime(true) < self::$giveBacksPausedUntil) {
+            return;
+        }
+
+        $startedAt = microtime(true);
+
+        try {
+            RedisCommand::briefly($this->redis, $lockKey, self::WAKE_SLICE_MS / 1000, fn (): bool => RedisCommand::deleteIfEqual($this->redis, $lockKey, $token, $logger));
+        } catch (\Throwable $e) {
+            self::$giveBacksPausedUntil = RedisCommand::pauseAfter(microtime(true) - $startedAt);
+            $logger?->warning('MemoLock could not give back "{key}", which a SET that failed may hold; it expires on its own: {message}', ['key' => $lockKey, 'message' => $e->getMessage()]);
+        }
     }
 
     /**
@@ -669,6 +802,12 @@ final class MemoLock implements Election
      * reads the pool again. So an extra message costs one read, and a missing
      * one costs a waiter one slice (WAKE_SLICE_MS).
      *
+     * The message also goes out when Redis answered the delete with an error,
+     * since the value is saved and the waiters can be served it. Not when the
+     * delete got no answer: the connection is broken or Redis is down, and
+     * the message would be a second attempt to reach it, made in the
+     * holder's finally block before the computed value is returned.
+     *
      * It never throws. It runs in a finally block, where anything it threw,
      * even an \Error from the Redis client, would replace the value just
      * computed.
@@ -676,17 +815,28 @@ final class MemoLock implements Election
     private function release(string $lockKey, string $channel, string $token, ?LoggerInterface $logger): void
     {
         try {
-            RedisCommand::deleteIfEqual($this->redis, $lockKey, $token);
-            $this->redis->publish($channel, self::WAKE_MESSAGE);
+            RedisCommand::deleteIfEqual($this->redis, $lockKey, $token, $logger);
         } catch (\Throwable $e) {
-            // the lock expires on its own, and waiters notice within one slice
+            // the lock expires on its own
             $logger?->warning('MemoLock could not release "{key}": {message}', ['key' => $lockKey, 'message' => $e->getMessage()]);
+
+            if (!RedisCommand::answered($this->redis, $e)) {
+                return;
+            }
+        }
+
+        try {
+            RedisCommand::call($this->redis, fn (): mixed => $this->redis->publish($channel, self::WAKE_MESSAGE), $logger);
+        } catch (\Throwable $e) {
+            // waiters notice within one slice
+            $logger?->warning('MemoLock could not wake the waiters of "{key}": {message}', ['key' => $lockKey, 'message' => $e->getMessage()]);
         }
     }
 
     /**
      * Waits until the holder releases the lock, for at most $waitTimeoutMs,
-     * and never past $until.
+     * and never past $until. Returns false when Redis could not say, on the
+     * first look, whether the lock is there at all (see __invoke()).
      *
      * It waits in slices. Before each SUBSCRIBE it checks the lock. If the
      * lock is already gone, nobody is left to send a message, so it returns at
@@ -694,8 +844,16 @@ final class MemoLock implements Election
      * the lock is still held, it listens for a message for one slice, then
      * checks the lock again. Without a subscriber connection it polls the
      * lock instead (see poll()).
+     *
+     * A phpredis RedisCluster subscriber cannot listen for a slice: its node
+     * connections keep the read timeout they were opened with, whatever
+     * setOption() says, so one SUBSCRIBE would listen for that whole timeout
+     * (seconds, a minute by default) and then return as if nothing were
+     * amiss. On one, the waiter polls the lock too. A plain connection to any
+     * one node of the cluster does listen for slices, and still hears the
+     * wake-up: the cluster passes a PUBLISH on to every node.
      */
-    private function wait(string $lockKey, string $channel, ?LoggerInterface $logger, ?float $until = null): void
+    private function wait(string $lockKey, string $channel, ?LoggerInterface $logger, ?float $until = null): bool
     {
         $deadline = microtime(true) + $this->waitTimeoutMs / 1000;
 
@@ -707,18 +865,19 @@ final class MemoLock implements Election
 
         // no second connection: check the lock key on a timer instead
         if (null === $this->subscriberFactory) {
-            $this->poll($lockKey, $deadline);
-
-            return;
+            return $this->poll($lockKey, $deadline, $logger);
         }
 
-        while (true) {
-            $remaining = $this->remaining($lockKey);
+        $told = null;
 
-            if (null === $remaining) {
+        while (true) {
+            $remaining = $this->remaining($lockKey, $logger);
+            $told ??= false !== $remaining;
+
+            if (null === $remaining || false === $remaining) {
                 // the lock is gone, or Redis cannot be asked: either way there
                 // is nothing to wait for
-                return;
+                return $told;
             }
 
             // one slice, or less when the deadline is closer
@@ -731,34 +890,75 @@ final class MemoLock implements Election
             }
 
             if ($slice <= 0) {
-                return;
+                return $told;
+            }
+
+            $subscriber = $this->subscriber($logger);
+
+            if (null === $subscriber) {
+                // nothing to listen on, or nothing that listens for a slice:
+                // look at the lock on a timer for the rest of the wait
+                $this->poll($lockKey, $deadline, $logger);
+
+                return $told;
             }
 
             // stop when the message came or the time is up; otherwise check
             // the lock again
-            if ($this->listen($channel, $slice, $logger) || microtime(true) >= $deadline) {
-                return;
+            if ($this->listen($subscriber, $channel, $slice, $logger) || microtime(true) >= $deadline) {
+                return $told;
             }
         }
     }
 
     /**
      * How long the lock has left to live, in milliseconds. 0 when it has no
-     * expiry. Null when it is gone, or when Redis cannot be asked.
+     * expiry. Null when it is gone; false when Redis cannot be asked, or
+     * answers something that is no time to live.
      */
-    private function remaining(string $lockKey): ?int
+    private function remaining(string $lockKey, ?LoggerInterface $logger): int|false|null
     {
         try {
-            $ttl = $this->redis->pttl($lockKey);
+            $ttl = RedisCommand::call($this->redis, fn (): mixed => $this->redis->pttl($lockKey), $logger);
         } catch (\Throwable) {
+            return false;
+        }
+
+        if (!\is_int($ttl)) {
+            return false;
+        }
+
+        return -2 === $ttl ? null : max(0, $ttl);
+    }
+
+    /**
+     * The second connection, used only to SUBSCRIBE, opened on the first wait
+     * and kept. Null when there is none to listen on: no factory, a factory
+     * that failed, or one that returned a phpredis RedisCluster, which cannot
+     * listen for a slice (see wait()). That one is let go, not closed: it may
+     * be a connection the application still uses.
+     */
+    private function subscriber(?LoggerInterface $logger): \Redis|\Relay\Relay|\Relay\Cluster|null
+    {
+        if (null !== $this->subscriber || $this->polls || null === $factory = $this->subscriberFactory) {
+            return $this->subscriber;
+        }
+
+        try {
+            $subscriber = $factory();
+        } catch (\Throwable $e) {
+            $logger?->debug('MemoLock could not open a subscriber connection: {message}', ['message' => $e->getMessage()]);
+
             return null;
         }
 
-        if (!\is_int($ttl) || -2 === $ttl) {
+        if ($subscriber instanceof \RedisCluster) {
+            $this->polls = true;
+
             return null;
         }
 
-        return max(0, $ttl);
+        return $this->subscriber = $subscriber;
     }
 
     /**
@@ -766,19 +966,9 @@ final class MemoLock implements Election
      * message arrived, and false when the slice passed without one or the
      * connection failed.
      */
-    private function listen(string $channel, float $sliceMs, ?LoggerInterface $logger): bool
+    private function listen(\Redis|\Relay\Relay|\Relay\Cluster $subscriber, string $channel, float $sliceMs, ?LoggerInterface $logger): bool
     {
-        if (null === $factory = $this->subscriberFactory) {
-            return false;
-        }
-
-        try {
-            $subscriber = $this->subscriber ??= $factory();
-        } catch (\Throwable $e) {
-            $logger?->debug('MemoLock could not open a subscriber connection: {message}', ['message' => $e->getMessage()]);
-
-            return false;
-        }
+        $woken = false;
 
         try {
             $subscriber->setOption(
@@ -790,11 +980,17 @@ final class MemoLock implements Election
             // the first message ends the wait. ext-redis ignores an exception
             // thrown from this callback and keeps listening, so the callback
             // unsubscribes, which is the only way to stop it
-            $subscriber->subscribe([$channel], static function (\Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster $connection, string $subscribed): void {
+            $subscriber->subscribe([$channel], static function (\Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster $connection, string $subscribed) use (&$woken): void {
+                $woken = true;
                 $connection->unsubscribe([$subscribed]);
             });
 
-            return true;
+            // a client can also come back from SUBSCRIBE when its read times
+            // out, with no message and no exception: only the callback says
+            // that one came
+            if ($woken) {
+                return true;
+            }
         } catch (\Throwable $e) {
             // the read timed out because no message came within the slice, or
             // Redis went away
@@ -826,28 +1022,40 @@ final class MemoLock implements Election
             restore_error_handler();
         }
 
-        return false;
+        return $woken;
     }
 
     /**
-     * Used when there is no second connection: checks every $pollIntervalMs
-     * whether the lock key still exists, until it is gone or $deadline
-     * passes. The value is still computed once, but a waiter notices the
-     * release up to $pollIntervalMs late instead of being woken by a message.
+     * Used when there is no second connection to listen on: checks every
+     * $pollIntervalMs whether the lock key still exists, until it is gone or
+     * $deadline passes. The value is still computed once, but a waiter
+     * notices the release up to $pollIntervalMs late instead of being woken
+     * by a message. Returns false when the first check could not say
+     * whether the lock is there.
      */
-    private function poll(string $lockKey, float $deadline): void
+    private function poll(string $lockKey, float $deadline, ?LoggerInterface $logger): bool
     {
-        while (microtime(true) < $deadline) {
-            usleep($this->pollIntervalMs * 1000);
+        $told = null;
+
+        while (($left = $deadline - microtime(true)) > 0) {
+            // the last sleep ends at the deadline, not after it
+            usleep((int) (min($this->pollIntervalMs / 1000, $left) * 1_000_000));
 
             try {
-                if (!$this->redis->exists($lockKey)) {
-                    return;
-                }
+                $exists = RedisCommand::call($this->redis, fn (): mixed => $this->redis->exists($lockKey), $logger);
             } catch (\Throwable) {
-                // Redis cannot be asked: stop waiting
-                return;
+                $exists = null;
+            }
+
+            $held = true === $exists || (\is_int($exists) && $exists > 0);
+            $told ??= $held || 0 === $exists;
+
+            if (!$held) {
+                // gone, or Redis cannot be asked: stop waiting
+                return $told;
             }
         }
+
+        return $told ?? true;
     }
 }

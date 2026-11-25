@@ -13,6 +13,7 @@ namespace Artigo\Cache\Store;
 
 use Artigo\Cache\Deadline;
 use Artigo\Cache\Exception\InvalidArgumentException;
+use Artigo\Cache\RedisCommand;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
 use Symfony\Component\Lock\BlockingSharedLockStoreInterface;
 use Symfony\Component\Lock\BlockingStoreInterface;
@@ -46,7 +47,13 @@ use Symfony\Component\Lock\Store\RedisStore;
  *
  * Like MemoLock, it needs a second connection for SUBSCRIBE, because a
  * connection in subscribe mode cannot send any other command. fromDsn()
- * opens both.
+ * opens both; for a Redis Cluster DSN the second is a RedisCluster, which
+ * cannot listen for a slice, and the waiters poll (see waitFor()).
+ *
+ * A phpredis connection whose command failed in a way that can leave a late
+ * answer on it is closed, RedisStore's own commands included, so that the
+ * answer is never read as the answer to the next command (see
+ * RedisCommand::call()).
  */
 final class PubSubRedisStore extends RedisStore implements BlockingStoreInterface, BlockingSharedLockStoreInterface
 {
@@ -60,7 +67,20 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
      */
     private const WAKE_SLICE_MS = 100;
 
-    private \Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster|null $subscriber = null;
+    /**
+     * How often a waiter with nothing to listen on looks at the lock within
+     * a slice (see waitFor()).
+     */
+    private const POLL_MS = 25;
+
+    private \Redis|\Relay\Relay|\Relay\Cluster|null $subscriber = null;
+
+    /**
+     * Whether the factory returned a phpredis RedisCluster, which cannot
+     * listen for a slice (see waitFor()): then the waiters poll, and the
+     * factory is not called again.
+     */
+    private bool $polls = false;
 
     /**
      * @param \Closure():(\Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster) $subscriberFactory opens the second connection, used for SUBSCRIBE
@@ -127,24 +147,59 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
         $this->waitFor($key, fn () => $this->saveRead($key));
     }
 
+    public function save(Key $key): void
+    {
+        RedisCommand::call($this->redis, function () use ($key): void {
+            parent::save($key);
+        });
+    }
+
+    public function saveRead(Key $key): void
+    {
+        RedisCommand::call($this->redis, function () use ($key): void {
+            parent::saveRead($key);
+        });
+    }
+
+    public function putOffExpiration(Key $key, float $ttl): void
+    {
+        RedisCommand::call($this->redis, function () use ($key, $ttl): void {
+            parent::putOffExpiration($key, $ttl);
+        });
+    }
+
+    public function exists(Key $key): bool
+    {
+        return RedisCommand::call($this->redis, fn (): bool => parent::exists($key));
+    }
+
     /**
-     * Releases the lock as RedisStore does, then wakes the waiters. The
-     * message goes out even when the delete failed. A waiter does not trust
-     * the message, it simply tries the lock again. So an extra message costs
-     * one round trip, and a missing one costs a waiter one slice.
+     * Releases the lock as RedisStore does, then wakes the waiters. A waiter
+     * does not trust the message, it simply tries the lock again. So an extra
+     * message costs one round trip, and a missing one costs a waiter one
+     * slice.
+     *
+     * The message also goes out when the delete failed, for instance when
+     * Redis answered it with an error, except when a phpredis connection got
+     * no answer: then it is broken or Redis is down, and the message would be
+     * a second attempt to reach it.
      */
     public function delete(Key $key): void
     {
         try {
-            parent::delete($key);
-        } finally {
-            try {
-                $this->redis->publish(self::CHANNEL_PREFIX.$key, self::WAKE_MESSAGE);
-            } catch (\Exception) {
-                // the lock expires on its own, and waiters notice within one
-                // slice
+            RedisCommand::call($this->redis, function () use ($key): void {
+                parent::delete($key);
+            });
+        } catch (\Exception $e) {
+            // only a phpredis failure that got no answer leaves them asleep
+            if ((!$e instanceof \RedisException && !$e instanceof \RedisClusterException) || RedisCommand::answered($this->redis, $e)) {
+                $this->wake($key);
             }
+
+            throw $e;
         }
+
+        $this->wake($key);
     }
 
     /**
@@ -153,6 +208,11 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
      * longer than the holder's lock has left to live. The whole loop stops at
      * $waitTimeoutMs, or a second before max_execution_time if that comes
      * first.
+     *
+     * A phpredis RedisCluster subscriber cannot listen for a slice: its node
+     * connections keep the read timeout they were opened with, so a SUBSCRIBE
+     * would listen that whole timeout. With one, as without a subscriber,
+     * the waiter looks at the lock every POLL_MS within the slice instead.
      *
      * @param \Closure():void $attempt save() or saveRead(); throws LockConflictedException while the lock is held
      *
@@ -200,9 +260,29 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
                 $slice = min($slice, $remaining + 25);
             }
 
-            if ($slice > 0) {
-                $this->listen($channel, $slice);
+            if ($slice <= 0) {
+                continue;
             }
+
+            $subscriber = $this->subscriber();
+
+            if (null === $subscriber) {
+                $this->poll($lockKey, $slice);
+            } else {
+                $this->listen($subscriber, $channel, $slice);
+            }
+        }
+    }
+
+    /**
+     * Sends the wake-up for $key. Failing to is not worth an exception: the
+     * lock expires on its own, and waiters notice within one slice.
+     */
+    private function wake(Key $key): void
+    {
+        try {
+            RedisCommand::call($this->redis, fn (): mixed => $this->redis->publish(self::CHANNEL_PREFIX.$key, self::WAKE_MESSAGE));
+        } catch (\Exception) {
         }
     }
 
@@ -213,7 +293,7 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
     private function remaining(string $lockKey): ?int
     {
         try {
-            $ttl = $this->redis->pttl($lockKey);
+            $ttl = RedisCommand::call($this->redis, fn (): mixed => $this->redis->pttl($lockKey));
         } catch (\Exception) {
             return null;
         }
@@ -226,18 +306,58 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
     }
 
     /**
+     * The second connection, used only to SUBSCRIBE, opened on the first wait
+     * and kept. Null when there is none to listen on: a factory that failed,
+     * or one that returned a phpredis RedisCluster. That one is let go, not
+     * closed: it may be a connection the application still uses.
+     */
+    private function subscriber(): \Redis|\Relay\Relay|\Relay\Cluster|null
+    {
+        if (null !== $this->subscriber || $this->polls) {
+            return $this->subscriber;
+        }
+
+        try {
+            $subscriber = ($this->subscriberFactory)();
+        } catch (\Exception) {
+            return null;
+        }
+
+        if ($subscriber instanceof \RedisCluster) {
+            $this->polls = true;
+
+            return null;
+        }
+
+        return $this->subscriber = $subscriber;
+    }
+
+    /**
+     * Waits up to $sliceMs with nothing to listen on: looks at the lock every
+     * POLL_MS, and stops when it is gone.
+     */
+    private function poll(string $lockKey, float $sliceMs): void
+    {
+        $end = microtime(true) + $sliceMs / 1000;
+
+        while (($left = $end - microtime(true)) > 0) {
+            usleep((int) (min(self::POLL_MS / 1000, $left) * 1_000_000));
+
+            if (null === $this->remaining($lockKey)) {
+                return;
+            }
+        }
+    }
+
+    /**
      * Listens on the wake channel for up to $sliceMs. Returns true when a
      * message arrived, and false when the slice passed without one or the
      * connection failed. It handles ext-redis and Relay the same way
      * MemoLock does.
      */
-    private function listen(string $channel, float $sliceMs): bool
+    private function listen(\Redis|\Relay\Relay|\Relay\Cluster $subscriber, string $channel, float $sliceMs): bool
     {
-        try {
-            $subscriber = $this->subscriber ??= ($this->subscriberFactory)();
-        } catch (\Exception) {
-            return false;
-        }
+        $woken = false;
 
         try {
             $subscriber->setOption(
@@ -249,11 +369,17 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
             // the first message ends the wait. ext-redis ignores an exception
             // thrown from this callback and keeps listening, so the callback
             // unsubscribes, which is the only way to stop it
-            $subscriber->subscribe([$channel], static function (\Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster $connection, string $subscribed): void {
+            $subscriber->subscribe([$channel], static function (\Redis|\RedisCluster|\Relay\Relay|\Relay\Cluster $connection, string $subscribed) use (&$woken): void {
+                $woken = true;
                 $connection->unsubscribe([$subscribed]);
             });
 
-            return true;
+            // a client can also come back from SUBSCRIBE when its read times
+            // out, with no message and no exception: only the callback says
+            // that one came
+            if ($woken) {
+                return true;
+            }
         } catch (\Exception) {
             // the read timed out because no message came within the slice, or
             // Redis went away
@@ -281,6 +407,6 @@ final class PubSubRedisStore extends RedisStore implements BlockingStoreInterfac
             restore_error_handler();
         }
 
-        return false;
+        return $woken;
     }
 }

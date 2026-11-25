@@ -53,6 +53,14 @@ use Symfony\Contracts\Cache\ItemInterface;
  * fleet needs nothing but a store you already run, and is worth having on its
  * own. How fast the waiters wake up is a separate question, answered by
  * separate classes (MemoLock, and FleetLock on PubSubRedisStore).
+ *
+ * This class holds only the LockFactory, so it cannot close a connection
+ * whose command failed. On Symfony's RedisStore with phpredis before 6.4, a
+ * lock script whose read timed out can leave its answer on the connection,
+ * to be read as the answer to the next one: a lock can then look taken when
+ * it is not, or free when another process holds it. The fix is on the
+ * phpredis 6.4 line, out as a release candidate; PubSubRedisStore closes such
+ * a connection itself.
  */
 final class FleetLock implements Election
 {

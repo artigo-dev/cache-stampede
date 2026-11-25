@@ -48,6 +48,10 @@ server. The report takes the database 300 ms.
   served what it stored: 4 ms over the 300 ms with `MemoLock`, which is woken
   by a message, 108 ms over it with `FleetLock`, whose waiters poll.
 
+The wake-up figures in this README come from a single Redis node. On a
+phpredis Redis Cluster the waiters poll, unless they listen on a plain
+connection to one node ([how](#memolock-one-request-through-woken-by-a-message)).
+
 So the lock moves from a local file into a store every server shares, and a
 cold key costs the origin one computation whatever the fleet size, at the
 price of a few Redis commands per miss and a second connection for the
@@ -142,7 +146,8 @@ cold key that takes 300 ms to compute:
 \* except on the PostgreSQL stores, which block natively, and on
 `PubSubRedisStore`, whose waiters are woken by a message: 7 ms.
 † the subscriber is optional; without it `MemoLock` polls the lock key every
-25 ms. Still one origin call, just a slower wake-up.
+25 ms. Still one origin call, just a slower wake-up. It polls too when the
+subscriber is a phpredis `RedisCluster`.
 
 The 4 ms and the 108 ms come from the same run against the same Redis: what
 separates them is only how a waiter finds out, a message or a poll.
@@ -170,6 +175,13 @@ Redis connection, because a connection that listens for messages cannot serve
 anything else; `fromDsn()` opens both. Pass your own connection instead, and
 the second one comes from a factory you hand it; hand it none, and the waiters
 poll the lock key every 25 ms: still one origin call, just a slower wake-up.
+They poll too when the factory returns a phpredis `RedisCluster`, as the one
+`fromDsn()` builds for a cluster DSN does: a `RedisCluster` cannot listen
+100 ms at a time, since its node connections keep the read timeout they were
+opened with. They are then woken within `pollIntervalMs`, at about 40
+`EXISTS` a second per waiter with the defaults. A factory that returns a plain
+`\Redis` connection to any one node of the cluster keeps the message: the
+cluster passes a `PUBLISH` on to every node.
 
 ```php
 // both connections from one DSN
@@ -180,7 +192,23 @@ $lock = new MemoLock($redis, static fn () => RedisAdapter::createConnection('red
 
 // your own connection only: waiters poll the lock key instead
 $lock = new MemoLock($redis);
+
+// a cluster, with waiters woken by a message: a plain connection to one node
+$lock = new MemoLock($cluster, static function (): \Redis {
+    $node = new \Redis();
+    $node->connect('10.0.0.1', 6379);
+
+    return $node;
+});
 ```
+
+Your own connection may be the cache pool's. Then the cache and the lock share
+it. When a lock command fails and may have left an answer on the connection,
+the lock closes it, and that also ends what the connection held: an open
+`MULTI` or `WATCH`, and a name set with `CLIENT SETNAME`; the next command
+opens it again. The other way round, before phpredis 6.4 a cache command that
+timed out can leave its answer for the lock's next command
+([sharing a connection](docs/notes.md)).
 
 Set `lockTtlMs` to the longest the work should take: too low and the waiters
 see the lock expire and compute in parallel, too high and a holder that dies
@@ -225,6 +253,12 @@ use Symfony\Component\Lock\Store\RedisStore;
 $pool->setCallbackWrapper(new FleetLock(new LockFactory(new RedisStore($redis))));
 ```
 
+With the pool's `$redis`, cache and lock share one connection, and `FleetLock`
+holds only the factory, so it cannot close that connection when a command
+fails: on Symfony's `RedisStore`, before phpredis 6.4 a lock command whose read
+timed out can leave its answer for the next command. The fix is on the
+phpredis 6.4 line, out as a release candidate ([why](docs/notes.md)).
+
 On another store, only the store changes:
 
 ```php
@@ -234,7 +268,8 @@ use Symfony\Component\Lock\Store\DoctrineDbalPostgreSqlStore;
 // no Redis: PostgreSQL, on the Doctrine DBAL connection you already have
 $store = new DoctrineDbalPostgreSqlStore($connection);
 
-// Redis, with waiters woken by a message; fromDsn() opens both connections
+// Redis, with waiters woken by a message on the second connection fromDsn()
+// opens; with a Redis Cluster DSN they poll instead
 $store = PubSubRedisStore::fromDsn('redis://127.0.0.1');
 
 $pool->setCallbackWrapper(new FleetLock(new LockFactory($store)));
@@ -502,11 +537,20 @@ early: [docs/measurements.md](docs/measurements.md)
 
 ## Notes worth knowing
 
-Four things to know before production:
+Five things to know before production:
 
 - **Neither lock will ever be the reason a request fails.** An unreachable
   Redis or lock store means the value is computed without protection, and the
   PSR-3 logger says so.
+- **Before phpredis 6.4, a read timeout can leave a late answer behind.** It
+  is read as the answer to the next command, so a held lock could look free.
+  `MemoLock` and `PubSubRedisStore` close a connection whose command failed in
+  a way that can leave one; a lock whose command failed may then stay until
+  its TTL ends. On a Redis Cluster set to read from replicas, a closed
+  connection fails every replica read after it before phpredis 6.4, which
+  `MemoLock` reports through the logger a call hands it. `FleetLock` cannot
+  close anything. The fix is on the phpredis 6.4 line, out as a release
+  candidate ([the details](docs/notes.md)).
 - **Locking works under the CLI and on Windows.** Setting the wrapper
   overrides Symfony's default of disabling locking under the CLI SAPI, and
   Symfony disables `LockRegistry` entirely on Windows; neither lock here does.
@@ -564,7 +608,9 @@ them back, printing how often the origin was reached at each step.
 PHP 8.2+ · `symfony/cache` 6.4, 7.x or 8.x · and then either `ext-redis`/Relay
 and **Redis 7.2+ or Valkey 8+** for `MemoLock`, or `symfony/lock` for `FleetLock`.
 `StaleCache` needs nothing more; its `TerminateSubscriber` needs
-`symfony/event-dispatcher`.
+`symfony/event-dispatcher`. The fix for read timeouts in `ext-redis` is on the
+phpredis 6.4 line, out as a release candidate
+(see [Notes worth knowing](#notes-worth-knowing)).
 
 On Redis 8.4 and Valkey 9, `MemoLock` is four plain commands and no script. A
 conditional form the server refuses gets a compare-and-set script, the same

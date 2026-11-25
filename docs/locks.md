@@ -31,7 +31,9 @@ and costs a second Redis connection: a connection in subscribe mode cannot
 serve anything else, so the subscriber cannot be the one holding the lock.
 `fromDsn()` opens both for you; hand the constructor no subscriber factory and
 it degrades to polling the lock key every 25 ms (`pollIntervalMs`) — still one
-origin call, just a slower wake-up.
+origin call, just a slower wake-up. The figures in this file come from a single
+Redis node; on a phpredis Redis Cluster the waiters poll, unless they listen
+on a plain connection to one node (below).
 
 **How it works.** The lock is four plain commands and no script on Redis 8.4
 and Valkey 9: `SET NX PX` takes it, `SET … IFEQ` extends it while it is still
@@ -52,7 +54,20 @@ to expire is waited for about that long, and a wake-up that went out in the
 window before the subscription began — the holder was quick — costs one slice
 rather than the whole `waitTimeoutMs`. After the wait the waiter reads the
 item; a hit is served, and a miss — the holder died, or what it wrote expired
-at once — makes it race for the lock again.
+at once — makes it race for the lock again. In the cache wrapper a waiter
+waits for a holder for as long as the holder works, one `waitTimeoutMs` after
+another. Only a round in which Redis cannot say whether the lock is there at
+all is counted: after ten of those the value is computed without the lock,
+and a warning says so. A phpredis `RedisCluster` subscriber cannot listen for
+100 ms at a time, so with one the waiters poll the lock instead; a plain
+connection to any one node of the cluster hears the message
+([why](notes.md)).
+
+A phpredis connection whose command failed in a way that can leave a late
+answer on it is closed, so that the answer is never read as the answer to the
+next command; before phpredis 6.4 a read timeout can leave one behind. A lock
+whose command failed may stay until its TTL ends ([the details](notes.md),
+and what sharing the cache pool's connection means).
 
 **Settings.** `lockTtlMs` (30 000) is how long the lock may be held before it
 expires on its own; `waitTimeoutMs` (5 000) is how long a waiter waits before
@@ -107,6 +122,13 @@ use Symfony\Component\Lock\Store\RedisStore;
 
 $pool->setCallbackWrapper(new FleetLock(new LockFactory(new RedisStore($redis))));
 ```
+
+With the pool's own `$redis` the cache and the lock share one connection.
+`FleetLock` holds only the `LockFactory`, so it cannot close a connection whose
+command failed: with phpredis before 6.4, a timed-out command of either can
+leave its answer for the next one. The fix is on the phpredis 6.4 line, out as
+a release candidate; `PubSubRedisStore` closes such a connection itself
+([the details](notes.md)).
 
 **How it works.** A miss creates the lock `cache.stampede.<key>` and tries to
 acquire it without blocking. The winner computes, saves and releases. A loser
@@ -216,12 +238,17 @@ own. The wake-up can therefore live in either place: in `MemoLock`, at 4 ms,
 or inside `symfony/lock`, at 7 ms, where every Lock user would get it.
 
 **How it works.** Like `MemoLock`, it needs a second connection for the
-blocking `SUBSCRIBE`; `PubSubRedisStore::fromDsn()` opens both. A blocking
+blocking `SUBSCRIBE`; `PubSubRedisStore::fromDsn()` opens both, and with a
+Redis Cluster DSN, where that second one is a `RedisCluster`, the waiters poll
+the lock instead. A blocking
 acquire tries, waits for the holder's word a slice of 100 ms at a time, never
 longer than the holder's lock can live, and tries again; past `waitTimeoutMs`
 (30 000) it throws `LockConflictedException`, as the component's own stores
 do. `initialTtl` (300.0 s) is the locks' expiration delay, as `RedisStore`
-takes it.
+takes it. A phpredis connection whose command failed in a way that can leave a
+late answer on it is closed, for the commands `RedisStore` sends too, and
+with a phpredis `RedisCluster` subscriber the waiters poll the lock instead of
+listening ([why](notes.md)).
 
 ## Per-call overrides
 

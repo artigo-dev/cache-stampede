@@ -11,6 +11,7 @@ declare(strict_types=1);
 
 namespace Artigo\Cache\Tests;
 
+use Artigo\Cache\Exception\LockUnavailable;
 use Artigo\Cache\MemoLock;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
@@ -128,6 +129,22 @@ final class MemoLockWaitTest extends TestCase
         });
 
         self::assertSame(1, $opened, 'several slices passed on one connection');
+    }
+
+    public function testAPollEndsAtTheWaitTimeoutNotAtTheNextPoll(): void
+    {
+        // a poll far longer than the wait: each wait ends on time anyway
+        $this->redis->set($this->lockKeyFor('slow-poll'), 'another-workers-token', ['PX' => 30_000]);
+        $lock = new MemoLock($this->redis, lockTtlMs: 5_000, waitTimeoutMs: 50, pollIntervalMs: 2_000);
+        $startedAt = microtime(true);
+
+        try {
+            $lock->exclusively('slow-poll', static fn (): string => 'ran');
+            self::fail('the lock is held for thirty seconds');
+        } catch (LockUnavailable) {
+        }
+
+        self::assertLessThan(5.0, microtime(true) - $startedAt, 'ten waits of 50 ms, not ten polls of two seconds');
     }
 
     private function pool(int $waitTimeoutMs): RedisAdapter
