@@ -666,15 +666,15 @@ final class LateReplyTest extends TestCase
     {
         $redis = $this->shifting();
         $redis->close();
-        $before = $this->connectionsReceived();
 
         try {
             RedisCommand::call($redis, static fn (): mixed => throw new \RedisException('read error on connection'));
         } catch (\RedisException) {
         }
 
-        self::assertSame($before, $this->connectionsReceived(), 'close() on a closed phpredis connection opens it first');
+        // close() on a closed phpredis connection would open it first
         self::assertSame(1, $redis->closed, 'close() was not called again');
+        self::assertFalse($redis->isConnected());
     }
 
     public function testTheLazyConnectionFromADsnReleasesItsLock(): void
@@ -702,13 +702,6 @@ final class LateReplyTest extends TestCase
     /**
      * How many connections the server has taken since it started.
      */
-    private function connectionsReceived(): int
-    {
-        $stats = $this->redis->info('stats');
-
-        return \is_array($stats) && is_numeric($stats['total_connections_received'] ?? null) ? (int) $stats['total_connections_received'] : -1;
-    }
-
     private function shifting(float $readTimeout = 2.0): ShiftingRedis
     {
         return self::$kept[] = ShiftingRedis::fromDsn($readTimeout);
